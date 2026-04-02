@@ -33,6 +33,7 @@ struct MainMetrics {
 
 pub(crate) struct WorkerMetrics {
     pub conn_active: atomic::AtomicUsize,
+    pub ws_active: atomic::AtomicUsize,
     pub conn_handled: atomic::AtomicUsize,
     pub conn_err: atomic::AtomicUsize,
     pub req_handled: atomic::AtomicUsize,
@@ -60,6 +61,7 @@ impl WorkerMetrics {
     pub fn new() -> Self {
         Self {
             conn_active: 0.into(),
+            ws_active: 0.into(),
             conn_handled: 0.into(),
             conn_err: 0.into(),
             req_handled: 0.into(),
@@ -115,6 +117,7 @@ impl MetricsAggregator {
         let wrk_metrics = vec![
             (format!("{prefix}worker_lifetime"), "counter"),
             (format!("{prefix}connections_active"), "gauge"),
+            (format!("{prefix}websockets_active"), "gauge"),
             (format!("{prefix}connections_handled"), "counter"),
             (format!("{prefix}connections_err"), "counter"),
             (format!("{prefix}requests_handled"), "counter"),
@@ -236,6 +239,7 @@ fn collect_metrics(birth: &std::time::Instant, data: &Arc<WorkerMetrics>) -> Met
     vec![
         MetricValue::Abs(birth.elapsed().as_secs() as usize),
         MetricValue::Abs(data.conn_active.load(atomic::Ordering::Acquire)),
+        MetricValue::Abs(data.ws_active.load(atomic::Ordering::Acquire)),
         MetricValue::Abs(data.conn_handled.load(atomic::Ordering::Acquire)),
         MetricValue::Abs(data.conn_err.load(atomic::Ordering::Acquire)),
         MetricValue::Abs(data.req_handled.load(atomic::Ordering::Acquire)),

@@ -309,6 +309,8 @@ pub(crate) struct RSGIWebsocketProtocol {
     websocket: Arc<AsyncMutex<HyperWebsocket>>,
     upgrade: RwLock<Option<UpgradeData>>,
     transport: Arc<AsyncMutex<Option<WSTxStream>>>,
+    metrics: Option<crate::metrics::ArcWorkerMetrics>,
+    ws_counted: Arc<atomic::AtomicBool>,
 }
 
 impl RSGIWebsocketProtocol {
@@ -318,6 +320,7 @@ impl RSGIWebsocketProtocol {
         websocket: HyperWebsocket,
         upgrade: UpgradeData,
         disconnect_guard: Arc<Notify>,
+        metrics: Option<crate::metrics::ArcWorkerMetrics>,
     ) -> Self {
         Self {
             rt,
@@ -326,11 +329,25 @@ impl RSGIWebsocketProtocol {
             websocket: Arc::new(AsyncMutex::new(websocket)),
             upgrade: RwLock::new(Some(upgrade)),
             transport: Arc::new(AsyncMutex::new(None)),
+            metrics,
+            ws_counted: Arc::new(false.into()),
         }
     }
 
     fn consumed(&self) -> bool {
         self.upgrade.read().unwrap().is_none()
+    }
+
+    #[inline(always)]
+    fn decr_ws_active(&self) {
+        if self
+            .ws_counted
+            .compare_exchange(true, false, atomic::Ordering::AcqRel, atomic::Ordering::Acquire)
+            .is_ok()
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.ws_active.fetch_sub(1, atomic::Ordering::Release);
+        }
     }
 }
 
@@ -338,6 +355,7 @@ impl RSGIWebsocketProtocol {
 impl RSGIWebsocketProtocol {
     #[pyo3(signature = (status=None))]
     pub fn close(&self, status: Option<i32>) {
+        self.decr_ws_active();
         if let Some(tx) = self.tx.lock().unwrap().take() {
             let mut handle = None;
             if let Ok(mut transport) = self.transport.try_lock()
@@ -356,6 +374,8 @@ impl RSGIWebsocketProtocol {
         let mut upgrade = self.upgrade.write().unwrap().take().unwrap();
         let transport = self.websocket.clone();
         let itransport = self.transport.clone();
+        let metrics = self.metrics.clone();
+        let ws_counted = self.ws_counted.clone();
 
         future_into_py_futlike(self.rt.clone(), py, async move {
             let mut ws = transport.lock().await;
@@ -367,6 +387,10 @@ impl RSGIWebsocketProtocol {
                             let mut guard = itransport.lock().await;
                             *guard = Some(stx);
                         }
+                        if let Some(metrics) = metrics {
+                            metrics.ws_active.fetch_add(1, atomic::Ordering::Release);
+                        }
+                        ws_counted.store(true, atomic::Ordering::Release);
                         FutureResultToPy::RSGIWSAccept(RSGIWebsocketTransport::new(rth, dg, itransport, srx))
                     }
                     _ => FutureResultToPy::Err(error_proto!()),

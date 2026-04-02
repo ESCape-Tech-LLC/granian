@@ -355,6 +355,8 @@ pub(crate) struct ASGIWebsocketProtocol {
     init_tx: Arc<atomic::AtomicBool>,
     init_event: Arc<Notify>,
     closed: Arc<atomic::AtomicBool>,
+    metrics: Option<crate::metrics::ArcWorkerMetrics>,
+    ws_counted: Arc<atomic::AtomicBool>,
 }
 
 impl ASGIWebsocketProtocol {
@@ -364,6 +366,7 @@ impl ASGIWebsocketProtocol {
         websocket: HyperWebsocket,
         upgrade: UpgradeData,
         disconnect_guard: Arc<Notify>,
+        metrics: Option<crate::metrics::ArcWorkerMetrics>,
     ) -> Self {
         Self {
             rt,
@@ -378,6 +381,19 @@ impl ASGIWebsocketProtocol {
             init_tx: Arc::new(false.into()),
             init_event: Arc::new(Notify::new()),
             closed: Arc::new(false.into()),
+            metrics,
+            ws_counted: Arc::new(false.into()),
+        }
+    }
+
+    #[inline(always)]
+    fn decr_ws_active(metrics: &Option<crate::metrics::ArcWorkerMetrics>, ws_counted: &atomic::AtomicBool) {
+        if ws_counted
+            .compare_exchange(true, false, atomic::Ordering::AcqRel, atomic::Ordering::Acquire)
+            .is_ok()
+            && let Some(metrics) = metrics
+        {
+            metrics.ws_active.fetch_sub(1, atomic::Ordering::Release);
         }
     }
 
@@ -389,6 +405,8 @@ impl ASGIWebsocketProtocol {
         let accept_notify = self.init_event.clone();
         let rx = self.ws_rx.clone();
         let tx = self.ws_tx.clone();
+        let metrics = self.metrics.clone();
+        let ws_counted = self.ws_counted.clone();
 
         future_into_py_futlike(self.rt.clone(), py, async move {
             if let Some(mut upgrade) = upgrade {
@@ -406,6 +424,13 @@ impl ASGIWebsocketProtocol {
                     *wtx = Some(tx);
                     *wrx = Some(rx);
                     drop(wrx);
+                    if ws_counted
+                        .compare_exchange(false, true, atomic::Ordering::AcqRel, atomic::Ordering::Acquire)
+                        .is_ok()
+                        && let Some(metrics) = metrics
+                    {
+                        metrics.ws_active.fetch_add(1, atomic::Ordering::Release);
+                    }
                     accepted.store(true, atomic::Ordering::Release);
                     accept_notify.notify_one();
                     return FutureResultToPy::None;
@@ -479,6 +504,8 @@ impl ASGIWebsocketProtocol {
         let init_ev = self.init_event.clone();
         let ws_rx = self.ws_rx.clone();
         let ws_tx = self.ws_tx.clone();
+        let metrics = self.metrics.clone();
+        let ws_counted = self.ws_counted.clone();
         self.closed.store(true, atomic::Ordering::Release);
 
         future_into_py_futlike(self.rt.clone(), py, async move {
@@ -486,6 +513,7 @@ impl ASGIWebsocketProtocol {
                 WebsocketDetachedTransport::new(true, ws_rx.lock().await.take(), Some(tx), frame)
                     .close()
                     .await;
+                Self::decr_ws_active(&metrics, &ws_counted);
             } else {
                 init_ev.notify_one();
             }
@@ -503,6 +531,7 @@ impl ASGIWebsocketProtocol {
         Option<oneshot::Sender<WebsocketDetachedTransport>>,
         WebsocketDetachedTransport,
     ) {
+        Self::decr_ws_active(&self.metrics, &self.ws_counted);
         let mut ws_rx = self.ws_rx.blocking_lock();
         let mut ws_tx = self.ws_tx.blocking_lock();
         (
@@ -532,6 +561,8 @@ impl ASGIWebsocketProtocol {
         let closed = self.closed.clone();
         let transport = self.ws_rx.clone();
         let guard_disconnect = self.disconnect_guard.clone();
+        let metrics = self.metrics.clone();
+        let ws_counted = self.ws_counted.clone();
 
         future_into_py_futlike(self.rt.clone(), py, async move {
             if !accepted.load(atomic::Ordering::Acquire) {
@@ -549,12 +580,14 @@ impl ASGIWebsocketProtocol {
                         Ok(Message::Ping(_) | Message::Pong(_)) => {}
                         Ok(message @ Message::Close(_)) => {
                             closed.store(true, atomic::Ordering::Release);
+                            Self::decr_ws_active(&metrics, &ws_counted);
                             return FutureResultToPy::ASGIWSMessage(message);
                         }
                         Ok(message) => return FutureResultToPy::ASGIWSMessage(message),
                         _ => {
                             // treat any recv error as a disconnection
                             closed.store(true, atomic::Ordering::Release);
+                            Self::decr_ws_active(&metrics, &ws_counted);
                             return FutureResultToPy::ASGIWSMessage(Message::Close(None));
                         }
                     }

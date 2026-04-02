@@ -307,6 +307,7 @@ where
             crate::net::SockAddr,
             crate::http::HTTPRequest,
             crate::http::HTTPProto,
+            Option<crate::metrics::ArcWorkerMetrics>,
         ) -> Ret
         + Copy,
     Ret: Future<Output = crate::http::HTTPResponse>,
@@ -336,7 +337,7 @@ struct WorkerSvc<F, C, P> {
 }
 
 macro_rules! service_proto_fut {
-    ($proto:expr, $self:expr, $req:expr) => {{
+    ($proto:expr, $self:expr, $req:expr, $metrics:expr) => {{
         let fut = ($self.f)(
             $self.rt.clone(),
             $self.disconnect_guard.clone(),
@@ -345,6 +346,7 @@ macro_rules! service_proto_fut {
             $self.addr_remote.clone(),
             $req,
             $proto,
+            $metrics,
         );
         Box::pin(async move { Ok::<_, hyper::Error>(fut.await) })
     }};
@@ -363,6 +365,7 @@ macro_rules! service_impl {
                     crate::net::SockAddr,
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
+                    Option<crate::metrics::ArcWorkerMetrics>,
                 ) -> Ret
                 + Copy
                 + Send
@@ -375,7 +378,7 @@ macro_rules! service_impl {
             type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
             fn call(&self, req: crate::http::HTTPRequest) -> Self::Future {
-                service_proto_fut!($proto, self, req)
+                service_proto_fut!($proto, self, req, None)
             }
         }
 
@@ -390,6 +393,7 @@ macro_rules! service_impl {
                     crate::net::SockAddr,
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
+                    Option<crate::metrics::ArcWorkerMetrics>,
                 ) -> Ret
                 + Copy
                 + Send
@@ -416,7 +420,7 @@ macro_rules! service_impl {
                     });
                 }
 
-                service_proto_fut!($proto, self, req)
+                service_proto_fut!($proto, self, req, None)
             }
         }
 
@@ -431,6 +435,7 @@ macro_rules! service_impl {
                     crate::net::SockAddr,
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
+                    Option<crate::metrics::ArcWorkerMetrics>,
                 ) -> Ret
                 + Copy
                 + Send
@@ -447,7 +452,7 @@ macro_rules! service_impl {
                     .metrics
                     .req_handled
                     .fetch_add(1, std::sync::atomic::Ordering::Release);
-                service_proto_fut!($proto, self, req)
+                service_proto_fut!($proto, self, req, Some(self.ctx.metrics.clone()))
             }
         }
 
@@ -462,6 +467,7 @@ macro_rules! service_impl {
                     crate::net::SockAddr,
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
+                    Option<crate::metrics::ArcWorkerMetrics>,
                 ) -> Ret
                 + Copy
                 + Send
@@ -501,7 +507,7 @@ macro_rules! service_impl {
                     });
                 }
 
-                service_proto_fut!($proto, self, req)
+                service_proto_fut!($proto, self, req, Some(self.ctx.metrics.clone()))
             }
         }
     };
@@ -1094,6 +1100,7 @@ macro_rules! acceptor_impl {
                     crate::net::SockAddr,
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
+                    Option<crate::metrics::ArcWorkerMetrics>,
                 ) -> Ret
                 + Copy
                 + Send
@@ -1127,6 +1134,7 @@ macro_rules! acceptor_impl {
                     crate::net::SockAddr,
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
+                    Option<crate::metrics::ArcWorkerMetrics>,
                 ) -> Ret
                 + Copy
                 + Send
@@ -1161,6 +1169,7 @@ macro_rules! acceptor_impl {
                     crate::net::SockAddr,
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
+                    Option<crate::metrics::ArcWorkerMetrics>,
                 ) -> Ret
                 + Copy
                 + Send
@@ -1194,6 +1203,7 @@ macro_rules! acceptor_impl {
                     crate::net::SockAddr,
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
+                    Option<crate::metrics::ArcWorkerMetrics>,
                 ) -> Ret
                 + Copy
                 + Send
