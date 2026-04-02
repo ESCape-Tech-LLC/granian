@@ -27,6 +27,7 @@ pub(crate) async fn handle(
     client_addr: SockAddr,
     req: HTTPRequest,
     scheme: HTTPProto,
+    _metrics: Option<crate::metrics::ArcWorkerMetrics>,
 ) -> HTTPResponse {
     let (parts, body) = req.into_parts();
     if let Ok((status, headers, body)) = call_http(rt, callback, server_addr, client_addr, scheme, parts, body).await {

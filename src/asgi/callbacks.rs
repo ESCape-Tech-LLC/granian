@@ -175,12 +175,13 @@ pub(crate) fn call_ws(
     server_addr: SockAddr,
     client_addr: SockAddr,
     scheme: HTTPProto,
+    metrics: Option<crate::metrics::ArcWorkerMetrics>,
     ws: HyperWebsocket,
     req: hyper::http::request::Parts,
     upgrade: UpgradeData,
 ) -> oneshot::Receiver<WebsocketDetachedTransport> {
     let (tx, rx) = oneshot::channel();
-    let protocol = WebsocketProtocol::new(rt.clone(), tx, ws, upgrade, disconnect_guard);
+    let protocol = WebsocketProtocol::new(rt.clone(), tx, ws, upgrade, disconnect_guard, metrics);
 
     rt.spawn_blocking(move |py| {
         if let Ok(scope) = build_scope_ws(py, req, server_addr, client_addr, scheme)

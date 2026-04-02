@@ -475,6 +475,7 @@ Granian exposes the following runtime metrics in Prometheus format. All the metr
 | `workers_respawns_for_lifetime` | counter | absolute number | global | Number of times Granian respawned a worker due to exceeding lifetime |
 | `worker_lifetime` | counter | seconds | worker | Current lifetime of the worker |
 | `connections_active` | gauge | absolute number | worker | Number of active connections |
+| `websockets_active` | gauge | absolute number | worker | Number of active websocket connections accepted by the application |
 | `connections_handled` | counter | absolute number | worker | Number of accepted connections |
 | `connections_err` | gauge | absolute number | worker | Number of failed connections |
 | `requests_handled` | counter | absolute number | worker | Number of processed requests |

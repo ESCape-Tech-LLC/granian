@@ -206,6 +206,7 @@ macro_rules! serve_fn {
                     crate::net::SockAddr,
                     crate::http::HTTPRequest,
                     HTTPProto,
+                    Option<crate::metrics::ArcWorkerMetrics>,
                 ) -> Ret
                 + Copy,
             M: Clone + Sync,
@@ -313,6 +314,7 @@ macro_rules! serve_fn {
                     crate::net::SockAddr,
                     crate::http::HTTPRequest,
                     HTTPProto,
+                    Option<crate::metrics::ArcWorkerMetrics>,
                 ) -> Ret
                 + Copy
                 + Send,

@@ -46,6 +46,7 @@ macro_rules! handle_request {
             client_addr: SockAddr,
             req: HTTPRequest,
             scheme: HTTPProto,
+            _metrics: Option<crate::metrics::ArcWorkerMetrics>,
         ) -> HTTPResponse {
             let (parts, body) = req.into_parts();
             handle_http_response!(
@@ -74,6 +75,7 @@ macro_rules! handle_request_with_ws {
             client_addr: SockAddr,
             mut req: HTTPRequest,
             scheme: HTTPProto,
+            metrics: Option<crate::metrics::ArcWorkerMetrics>,
         ) -> HTTPResponse {
             if is_ws_upgrade(&req) {
                 return match ws_upgrade(&mut req, None) {
@@ -93,6 +95,7 @@ macro_rules! handle_request_with_ws {
                                 server_addr,
                                 client_addr,
                                 scheme,
+                                metrics,
                                 ws,
                                 parts,
                                 UpgradeData::new(res, restx),
