@@ -2,10 +2,10 @@
 
 
 
-Run at: Mon 01 Dec 2025, 16:13    
-Environment: AMD Ryzen 7 5700X @ Gentoo Linux 6.12.58 (CPUs: 16)    
+Run at: Wed 05 Aug 2026, 16:42    
+Environment: AMD Ryzen 7 5700X @ Gentoo Linux 6.18.41 (CPUs: 16)    
 Python version: 3.13    
-Granian version: 2.6.0
+Granian version: 2.8.1
 
 ### Methodology
 
@@ -14,7 +14,7 @@ Unless otherwise specified in the specific benchmark section, Granian is run:
 - Using default configuration, thus:
   - 1 worker
   - 1 runtime thread
-- With `--runtime-mode` set to `st` on ASGI and `mt` otherwise
+- With `--runtime-mode` set to `auto`
 - With `--http 1` flag
 - With `--no-ws` flag
 - With `uvloop` event-loop on async protocols
@@ -27,10 +27,10 @@ RSGI plain text response comparison using protocol `response_str` and `response_
 
 | Type | Total requests | RPS | avg latency | max latency |
 | --- | --- | --- | --- | --- |
-| bytes 10B (c64) | 1473133 | 147247 | 0.433ms | 36.05ms |
-| str 10B (c64) | 1487132 | 148650 | 0.429ms | 20.978ms |
-| bytes 100KB (c64) | 567227 | 56711 | 1.124ms | 43.169ms |
-| str 100KB (c64) | 588868 | 58876 | 1.084ms | 22.076ms |
+| bytes 10B (c64) | 1464838 | 146427 | 0.435ms | 39.753ms |
+| str 10B (c64) | 1449800 | 144931 | 0.439ms | 36.381ms |
+| bytes 100KB (c64) | 562072 | 56194 | 1.135ms | 36.921ms |
+| str 100KB (c64) | 572818 | 57275 | 1.113ms | 36.285ms |
 
 
 ## Interfaces
@@ -41,15 +41,15 @@ The 1KB GET and POST tests are run with `--blocking-threads 1`.
 
 | Request | Total requests | RPS | avg latency | max latency |
 | --- | --- | --- | --- | --- |
-| RSGI get 1KB (c128) | 1478812 | 147828 | 0.863ms | 46.558ms |
-| RSGI echo 1KB (c128) | 1192967 | 119250 | 1.069ms | 63.689ms |
-| RSGI echo 100KB (iter) (c64) | 176773 | 17680 | 3.607ms | 59.939ms |
-| ASGI get 1KB (c128) | 1210305 | 121000 | 1.053ms | 67.592ms |
-| ASGI echo 1KB (c128) | 778324 | 77817 | 1.639ms | 52.452ms |
-| ASGI echo 100KB (iter) (c64) | 196408 | 19642 | 3.245ms | 68.731ms |
-| WSGI get 1KB (c64) | 1462067 | 146147 | 0.436ms | 26.963ms |
-| WSGI echo 1KB (c64) | 1330240 | 132975 | 0.479ms | 40.363ms |
-| WSGI echo 100KB (iter) (c64) | 93828 | 9387 | 6.8ms | 52.449ms |
+| RSGI get 1KB (c128) | 1430994 | 143073 | 0.891ms | 49.009ms |
+| RSGI echo 1KB (c128) | 1199952 | 119975 | 1.062ms | 71.355ms |
+| RSGI echo 100KB (iter) (c64) | 176984 | 17699 | 3.605ms | 45.524ms |
+| ASGI get 1KB (c128) | 1408587 | 140814 | 0.906ms | 36.76ms |
+| ASGI echo 1KB (c128) | 1024809 | 102467 | 1.246ms | 34.832ms |
+| ASGI echo 100KB (iter) (c64) | 183551 | 18359 | 3.475ms | 49.857ms |
+| WSGI get 1KB (c64) | 1439918 | 143939 | 0.443ms | 22.739ms |
+| WSGI echo 1KB (c64) | 1390024 | 138958 | 0.458ms | 33.443ms |
+| WSGI echo 100KB (iter) (c64) | 100679 | 10072 | 6.344ms | 36.668ms |
 
 
 ## HTTP/2
@@ -61,10 +61,10 @@ HTTP/2 tests are run with `--http 2`.
 
 | Request | Total requests | RPS | avg latency | max latency |
 | --- | --- | --- | --- | --- |
-| HTTP/1 get 1KB (c128) | 2069053 | 206831 | 0.616ms | 57.395ms |
-| HTTP/1 echo 1KB (c128) | 1225556 | 122519 | 1.04ms | 66.926ms |
-| HTTP/2 get 1KB (c128) | 1853067 | 185274 | 2.748ms | 8.315ms |
-| HTTP/2 echo 1KB (c128) | 1138862 | 113864 | 4.467ms | 10.987ms |
+| HTTP/1 get 1KB (c128) | 2382173 | 238104 | 0.535ms | 43.713ms |
+| HTTP/1 echo 1KB (c128) | 1583227 | 158278 | 0.805ms | 44.055ms |
+| HTTP/2 get 1KB (c128) | 2000276 | 199991 | 2.545ms | 9.009ms |
+| HTTP/2 echo 1KB (c128) | 1431555 | 143141 | 3.557ms | 10.351ms |
 
 
 ## File responses
@@ -76,17 +76,14 @@ Tests are run with `--runtime-blocking-threads 1`.
 
 | Request | Total requests | RPS | avg latency | max latency |
 | --- | --- | --- | --- | --- |
-| RSGI (c128) | 494402 | 49439 | 2.578ms | 60.546ms |
-| ASGI (c128) | 288425 | 28847 | 4.425ms | 60.092ms |
-| ASGI pathsend (c128) | 471775 | 47174 | 2.7ms | 77.695ms |
+| RSGI (c128) | 483291 | 48329 | 2.64ms | 68.305ms |
+| ASGI (c128) | 383219 | 38321 | 3.329ms | 51.698ms |
+| ASGI pathsend (c128) | 481069 | 48108 | 2.65ms | 74.848ms |
 
 
 ### Other benchmarks
 
+- [Concurrency benchmarks](./concurrency.md)
 - [Versus 3rd party servers](./vs.md)
 - [AsyncIO-specific benchmarks](./asyncio.md)
 - [Python versions](./pyver.md)
-
-### 3rd party benchmarks
-
-- [TFB](./external/tfb.md)

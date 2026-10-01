@@ -14,7 +14,7 @@ Unless otherwise specified in the specific benchmark section, Granian is run:
 - Using default configuration, thus:
   - 1 worker
   - 1 runtime thread
-- With `--runtime-mode` set to `st` on ASGI and `mt` otherwise
+- With `--runtime-mode` set to `auto`
 - With `--http 1` flag
 - With `--no-ws` flag
 - With `uvloop` event-loop on async protocols
@@ -35,10 +35,7 @@ Tests are peformed using `oha` utility, with the concurrency specified in the sp
 
 ### Other benchmarks
 
+- [Concurrency benchmarks](./concurrency.md)
 - [Versus 3rd party servers](./vs.md)
 - [AsyncIO-specific benchmarks](./asyncio.md)
 - [Python versions](./pyver.md)
-
-### 3rd party benchmarks
-
-- [TFB](./external/tfb.md)

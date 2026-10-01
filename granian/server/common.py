@@ -32,6 +32,13 @@ WORKERS_METHODS = {
 }
 
 
+def _tcp_migrate_req_enabled():
+    try:
+        return Path('/proc/sys/net/ipv4/tcp_migrate_req').read_text().strip() == '1'
+    except OSError:
+        return False
+
+
 class AbstractWorker:
     _idl = 'id'
 
@@ -291,7 +298,10 @@ class AbstractServer(Generic[WT]):
 
     @property
     def _bind_addr_fmt(self):
-        return f'unix:{self.bind_uds}' if self.bind_uds else f'{self.bind_addr}:{self.bind_port}'
+        if self.bind_uds:
+            return f'unix:{self.bind_uds}'
+        bind_addr = f'[{self.bind_addr}]' if ':' in self.bind_addr else self.bind_addr
+        return f'{bind_addr}:{self.bind_port}'
 
     @staticmethod
     def _call_hooks(hooks):
@@ -315,8 +325,12 @@ class AbstractServer(Generic[WT]):
             self._ssp = UnixSocketSpec(str(self.bind_uds), self.backlog, self.uds_permissions)
         else:
             self._ssp = SocketSpec(self.bind_addr, self.bind_port, self.backlog)
+            if sys.platform == 'linux':
+                self._ssp.build()
+                return
         self._shd = self._ssp.build()
         self._sfd = self._shd.get_fd()
+        self._ssp = None
 
     def signal_handler_interrupt(self, *args, **kwargs):
         self.interrupt_signal = True
@@ -356,22 +370,32 @@ class AbstractServer(Generic[WT]):
                     logger.warning(f'Killing old worker-{idx + 1} after it refused to gracefully stop')
                     old_wrk.kill()
                     old_wrk.join()
+
+            logger.info(f'Stopped old worker-{idx + 1}')
+
         self._metrics.incr_spawn(len(workers))
 
     def _stop_workers(self):
         for wrk in self.wrks:
             wrk.terminate()
 
+        now = time.monotonic()
+        timeout = self.workers_kill_timeout if self.workers_kill_timeout else None
         for wrk in self.wrks:
-            wrk.join(self.workers_kill_timeout)
+            wrk.join(timeout)
+
             if self.workers_kill_timeout:
                 # the worker might still be reported after `join`, let's context switch
                 if wrk.is_alive():
                     time.sleep(0.001)
                 if wrk.is_alive():
-                    logger.warning(f'Killing worker-{wrk.idx} after it refused to gracefully stop')
+                    logger.warning(f'Killing worker-{wrk.idx + 1} after it refused to gracefully stop')
                     wrk.kill()
                     wrk.join()
+
+                timeout = max(timeout - (time.monotonic() - now), 0.001)
+
+            logger.info(f'Stopped worker-{wrk.idx + 1}')
 
         self.wrks.clear()
 
@@ -481,12 +505,16 @@ class AbstractServer(Generic[WT]):
 
     def shutdown(self, exit_code=0):
         logger.info('Shutting down granian')
+
         if self.metrics_enabled:
             self._stop_metrics()
         self._stop_workers()
         self._stop_ipc()
         self._call_hooks(self.hooks_shutdown)
         self._unlink_pidfile()
+
+        logger.info('Granian shutdown completed, see ya!')
+
         if not exit_code and self.interrupt_children:
             exit_code = 1
         if exit_code:
@@ -494,6 +522,7 @@ class AbstractServer(Generic[WT]):
 
     def _reload(self, spawn_target, target_loader):
         logger.info('HUP signal received, gracefully respawning workers..')
+
         workers = list(range(self.workers))
         self.reload_signal = False
         self.respawned_wrks.clear()
@@ -683,6 +712,20 @@ class AbstractServer(Generic[WT]):
         if self.blocking_threads_idle_timeout < 5 or self.blocking_threads_idle_timeout > 600:
             logger.error('Blocking threads idle timeout must be between 5 and 600 seconds')
             raise ConfigurationError('blocking_threads_idle_timeout')
+
+        if (
+            sys.platform == 'linux'
+            and self.workers > 1
+            and (self.workers_lifetime is not None or self.workers_rss is not None)
+            and not self.bind_uds
+            and not _tcp_migrate_req_enabled()
+        ):
+            logger.warning(
+                'Workers respawn is configured, but the net.ipv4.tcp_migrate_req sysctl is not enabled '
+                '(or the kernel does not support it, which requires Linux 5.14+): '
+                'queued connections may be reset when a worker respawns. '
+                'To avoid this, set `sysctl net.ipv4.tcp_migrate_req=1`.'
+            )
 
         cpus = multiprocessing.cpu_count()
         if self.workers > cpus:

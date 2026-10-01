@@ -4,9 +4,11 @@ use hyper::body;
 use pyo3::{prelude::*, pybacked::PyBackedStr};
 use std::{
     borrow::Cow,
+    pin::Pin,
     sync::{Arc, Mutex, RwLock, atomic},
+    task::{Context, Poll},
 };
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, SetOnce, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::{
@@ -15,11 +17,55 @@ use super::{
 };
 use crate::{
     conversion::FutureResultToPy,
-    runtime::{RuntimeRef, empty_future_into_py, err_future_into_py, future_into_py_futlike},
+    runtime::{Runtime, RuntimeRef, empty_future_into_py, err_future_into_py, future_into_py_futlike},
     ws::{HyperWebsocket, UpgradeData, WSRxStream, WSTxStream},
 };
 
 pub(crate) type WebsocketDetachedTransport = (i32, bool, Option<WSTxStream>);
+
+struct ResponseBodyStream {
+    inner: mpsc::UnboundedReceiver<body::Bytes>,
+    closed: Arc<SetOnce<()>>,
+}
+
+impl Drop for ResponseBodyStream {
+    fn drop(&mut self) {
+        _ = self.closed.set(());
+    }
+}
+
+impl body::Body for ResponseBodyStream {
+    type Data = body::Bytes;
+    type Error = anyhow::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<body::Frame<Self::Data>, Self::Error>>> {
+        self.inner
+            .poll_recv(cx)
+            .map(|item| item.map(|data| Ok(body::Frame::data(data))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_closed() && self.inner.is_empty()
+    }
+
+    fn size_hint(&self) -> body::SizeHint {
+        body::SizeHint::default()
+    }
+}
+
+impl ResponseBodyStream {
+    fn new(notify: Arc<SetOnce<()>>) -> (mpsc::UnboundedSender<body::Bytes>, Self) {
+        let (body_tx, body_rx) = mpsc::unbounded_channel::<body::Bytes>();
+        let slf = Self {
+            inner: body_rx,
+            closed: notify,
+        };
+        (body_tx, slf)
+    }
+}
 
 #[pyclass(frozen, module = "granian._granian")]
 pub(crate) struct RSGIHTTPStreamTransport {
@@ -55,8 +101,8 @@ impl RSGIHTTPStreamTransport {
 #[pyclass(frozen, module = "granian._granian")]
 pub(crate) struct RSGIHTTPProtocol {
     rt: RuntimeRef,
+    disconnect_guard: Arc<SetOnce<()>>,
     tx: Mutex<Option<oneshot::Sender<PyResponse>>>,
-    disconnect_guard: Arc<Notify>,
     body: Mutex<Option<body::Incoming>>,
     body_stream: Arc<AsyncMutex<Option<http_body_util::BodyStream<body::Incoming>>>>,
     disconnected: Arc<atomic::AtomicBool>,
@@ -65,14 +111,14 @@ pub(crate) struct RSGIHTTPProtocol {
 impl RSGIHTTPProtocol {
     pub fn new(
         rt: RuntimeRef,
+        disconnect_guard: Arc<SetOnce<()>>,
         tx: oneshot::Sender<PyResponse>,
         body: body::Incoming,
-        disconnect_guard: Arc<Notify>,
     ) -> Self {
         Self {
             rt,
-            tx: Mutex::new(Some(tx)),
             disconnect_guard,
+            tx: Mutex::new(Some(tx)),
             body: Mutex::new(Some(body)),
             body_stream: Arc::new(AsyncMutex::new(None)),
             disconnected: Arc::new(atomic::AtomicBool::new(false)),
@@ -118,9 +164,7 @@ impl RSGIHTTPProtocol {
             let guard = &mut *body_stream.lock().await;
             match guard.as_mut().unwrap().next().await {
                 Some(chunk) => {
-                    let chunk = chunk
-                        .map(|buf| buf.into_data().unwrap_or_default())
-                        .unwrap_or(body::Bytes::new());
+                    let chunk = chunk.map_or(body::Bytes::new(), |buf| buf.into_data().unwrap_or_default());
                     FutureResultToPy::Bytes(chunk)
                 }
                 _ => {
@@ -139,7 +183,7 @@ impl RSGIHTTPProtocol {
         let guard = self.disconnect_guard.clone();
         let state = self.disconnected.clone();
         future_into_py_futlike(self.rt.clone(), py, async move {
-            guard.notified().await;
+            guard.wait().await;
             state.store(true, atomic::Ordering::Release);
             FutureResultToPy::None
         })
@@ -205,12 +249,7 @@ impl RSGIHTTPProtocol {
         headers: Vec<(PyBackedStr, PyBackedStr)>,
     ) -> PyResult<Bound<'p, RSGIHTTPStreamTransport>> {
         if let Some(tx) = self.tx.lock().unwrap().take() {
-            let (body_tx, body_rx) = mpsc::unbounded_channel::<body::Bytes>();
-            let body_stream = http_body_util::StreamBody::new(
-                tokio_stream::wrappers::UnboundedReceiverStream::new(body_rx)
-                    .map(body::Frame::data)
-                    .map(Result::Ok),
-            );
+            let (body_tx, body_stream) = ResponseBodyStream::new(self.disconnect_guard.clone());
             _ = tx.send(PyResponse::Body(PyResponseBody::new(
                 status,
                 headers,
@@ -229,15 +268,23 @@ pub(crate) struct RSGIWebsocketTransport {
     dg: Arc<Notify>,
     tx: Arc<AsyncMutex<Option<WSTxStream>>>,
     rx: Arc<AsyncMutex<WSRxStream>>,
+    closed: Arc<atomic::AtomicBool>,
 }
 
 impl RSGIWebsocketTransport {
-    pub fn new(rt: RuntimeRef, dg: Arc<Notify>, tx: Arc<AsyncMutex<Option<WSTxStream>>>, rx: WSRxStream) -> Self {
+    pub fn new(
+        rt: RuntimeRef,
+        dg: Arc<Notify>,
+        tx: Arc<AsyncMutex<Option<WSTxStream>>>,
+        rx: WSRxStream,
+        closed: Arc<atomic::AtomicBool>,
+    ) -> Self {
         Self {
             rt,
             dg,
             tx,
             rx: Arc::new(AsyncMutex::new(rx)),
+            closed,
         }
     }
 }
@@ -268,13 +315,14 @@ impl RSGIWebsocketTransport {
     }
 
     fn send_bytes<'p>(&self, py: Python<'p>, data: Cow<[u8]>) -> PyResult<Bound<'p, PyAny>> {
+        if self.closed.load(atomic::Ordering::Acquire) {
+            return err_future_into_py(py, error_proto!());
+        }
+
         let transport = self.tx.clone();
         let bdata: Box<[u8]> = data.into();
-
         future_into_py_futlike(self.rt.clone(), py, async move {
-            if let Ok(mut guard) = transport.try_lock()
-                && let Some(stream) = &mut *guard
-            {
+            if let Some(stream) = &mut *(transport.lock().await) {
                 return match stream.send(bdata[..].into()).await {
                     Ok(()) => FutureResultToPy::None,
                     _ => FutureResultToPy::Err(error_stream!()),
@@ -285,12 +333,13 @@ impl RSGIWebsocketTransport {
     }
 
     fn send_str<'p>(&self, py: Python<'p>, data: String) -> PyResult<Bound<'p, PyAny>> {
-        let transport = self.tx.clone();
+        if self.closed.load(atomic::Ordering::Acquire) {
+            return err_future_into_py(py, error_proto!());
+        }
 
+        let transport = self.tx.clone();
         future_into_py_futlike(self.rt.clone(), py, async move {
-            if let Ok(mut guard) = transport.try_lock()
-                && let Some(stream) = &mut *guard
-            {
+            if let Some(stream) = &mut *(transport.lock().await) {
                 return match stream.send(data.into()).await {
                     Ok(()) => FutureResultToPy::None,
                     _ => FutureResultToPy::Err(error_stream!()),
@@ -308,6 +357,7 @@ pub(crate) struct RSGIWebsocketProtocol {
     disconnect_guard: Arc<Notify>,
     websocket: Arc<AsyncMutex<HyperWebsocket>>,
     upgrade: RwLock<Option<UpgradeData>>,
+    closed: Arc<atomic::AtomicBool>,
     transport: Arc<AsyncMutex<Option<WSTxStream>>>,
 }
 
@@ -325,6 +375,7 @@ impl RSGIWebsocketProtocol {
             disconnect_guard,
             websocket: Arc::new(AsyncMutex::new(websocket)),
             upgrade: RwLock::new(Some(upgrade)),
+            closed: Arc::new(false.into()),
             transport: Arc::new(AsyncMutex::new(None)),
         }
     }
@@ -339,14 +390,19 @@ impl RSGIWebsocketProtocol {
     #[pyo3(signature = (status=None))]
     pub fn close(&self, status: Option<i32>) {
         if let Some(tx) = self.tx.lock().unwrap().take() {
-            let mut handle = None;
-            if let Ok(mut transport) = self.transport.try_lock()
-                && let Some(transport) = transport.take()
-            {
-                handle = Some(transport);
-            }
+            self.closed.store(true, atomic::Ordering::Release);
+            let transport = self.transport.clone();
+            let consumed = self.consumed();
 
-            let _ = tx.send((status.unwrap_or(0), self.consumed(), handle));
+            self.rt.spawn(async move {
+                let mut handle = None;
+                let mut transport = transport.lock().await;
+                if let Some(transport) = transport.take() {
+                    handle = Some(transport);
+                }
+
+                let _ = tx.send((status.unwrap_or(0), consumed, handle));
+            });
         }
     }
 
@@ -354,6 +410,7 @@ impl RSGIWebsocketProtocol {
         let rth = self.rt.clone();
         let dg = self.disconnect_guard.clone();
         let mut upgrade = self.upgrade.write().unwrap().take().unwrap();
+        let closed = self.closed.clone();
         let transport = self.websocket.clone();
         let itransport = self.transport.clone();
 
@@ -367,7 +424,7 @@ impl RSGIWebsocketProtocol {
                             let mut guard = itransport.lock().await;
                             *guard = Some(stx);
                         }
-                        FutureResultToPy::RSGIWSAccept(RSGIWebsocketTransport::new(rth, dg, itransport, srx))
+                        FutureResultToPy::RSGIWSAccept(RSGIWebsocketTransport::new(rth, dg, itransport, srx, closed))
                     }
                     _ => FutureResultToPy::Err(error_proto!()),
                 },

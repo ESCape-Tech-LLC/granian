@@ -2,12 +2,16 @@ name: build
 
 on: workflow_dispatch
 
+permissions: {}
+
 env:
-  PY_ALL: 3.10 3.11 3.12 3.13 3.13t 3.14 3.14t pypy3.11
+  PY_ALL: 3.10 3.11 3.12 3.13 3.14 3.14t 3.15 3.15t pypy3.11
 
 jobs:
   wheels:
     name: wheel ${{ matrix.platform || matrix.os }}(${{ matrix.target }}) - ${{ matrix.manylinux || 'auto' }} - ${{ matrix.allocator || 'auto' }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -19,39 +23,39 @@ jobs:
           - os: ubuntu
             platform: linux
             target: x86_64
-            interpreter: 3.10 3.11 3.12 3.13 3.14 pypy3.11
+            interpreter: 3.10 3.11 3.12 3.13 3.14 3.15 pypy3.11
           - os: ubuntu
             platform: linux
             target: x86_64
-            interpreter: 3.13t 3.14t
+            interpreter: 3.14t 3.15t
             allocator: mimalloc
           - os: ubuntu
             platform: linux
             target: i686
-            interpreter: 3.10 3.11 3.12 3.13 3.14
+            interpreter: 3.10 3.11 3.12 3.13 3.14 3.15
             allocator: jemalloc
           - os: ubuntu
             platform: linux
             target: i686
-            interpreter: 3.13t 3.14t
+            interpreter: 3.14t 3.15t
             allocator: mimalloc
           - os: ubuntu
             platform: linux
             target: aarch64
             # rust-cross/manylinux2014-cross:aarch64 has issues with `ring`
             container: ghcr.io/rust-cross/manylinux_2_28-cross:aarch64
-            interpreter: 3.10 3.11 3.12 3.13 3.14 pypy3.11
+            interpreter: 3.10 3.11 3.12 3.13 3.14 3.15 pypy3.11
           - os: ubuntu
             platform: linux
             target: aarch64
             # rust-cross/manylinux2014-cross:aarch64 has issues with `ring`
             container: ghcr.io/rust-cross/manylinux_2_28-cross:aarch64
-            interpreter: 3.13t 3.14t
+            interpreter: 3.14t 3.15t
             allocator: mimalloc
           - os: ubuntu
             platform: linux
             target: armv7
-            interpreter: 3.10 3.11 3.12 3.13 3.13t 3.14 3.14t
+            interpreter: 3.10 3.11 3.12 3.13 3.14 3.14t 3.15 3.15t
             allocator: jemalloc
           - os: ubuntu
             platform: linux
@@ -70,31 +74,33 @@ jobs:
             allocator: mimalloc
           - os: macos
             target: x86_64
-            interpreter: 3.10 3.11 3.12 3.13 3.14 pypy3.11
+            interpreter: 3.10 3.11 3.12 3.13 3.14 3.15 pypy3.11
           - os: macos
             target: x86_64
-            interpreter: 3.13t 3.14t
+            interpreter: 3.14t 3.15t
             allocator: mimalloc
           - os: macos
             target: aarch64
-            interpreter: 3.10 3.11 3.12 3.13 3.14 pypy3.11
+            interpreter: 3.10 3.11 3.12 3.13 3.14 3.15 pypy3.11
           - os: macos
             target: aarch64
-            interpreter: 3.13t 3.14t
+            interpreter: 3.14t 3.15t
             allocator: mimalloc
           - os: windows
             target: x86_64
-            interpreter: 3.10 3.11 3.12 3.13 3.13t 3.14 3.14t pypy3.11
+            interpreter: 3.10 3.11 3.12 3.13 3.14 3.14t 3.15 3.15t pypy3.11
             allocator: mimalloc
 
     runs-on: ${{ matrix.os }}-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Set jemalloc for aarch64 Linux
         if: matrix.target == 'aarch64' && matrix.os == 'ubuntu'
         run: |
           echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> $GITHUB_ENV
-      - uses: pyo3/maturin-action@v1
+      - uses: pyo3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           rust-toolchain: stable
           command: build
@@ -104,7 +110,7 @@ jobs:
           container: ${{ matrix.container }}
           docker-options: -e CI
       - name: Upload wheels
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-${{ matrix.platform || matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux || 'auto' }}-${{ matrix.allocator || 'auto' }}
           path: dist

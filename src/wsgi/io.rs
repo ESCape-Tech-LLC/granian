@@ -1,17 +1,11 @@
 use futures::StreamExt;
 use http_body_util::BodyExt;
-use hyper::{
-    body,
-    header::{HeaderMap, HeaderName, HeaderValue, SERVER as HK_SERVER},
-};
+use hyper::{body, header::HeaderMap};
 use pyo3::{prelude::*, pybacked::PyBackedStr};
 use std::{borrow::Cow, sync::Mutex};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{
-    http::{HTTPResponseBody, HV_SERVER},
-    utils::log_application_callable_exception,
-};
+use crate::{conversion::headers_from_py, http::HTTPResponseBody, utils::log_application_callable_exception};
 
 // NOTE: for unknown reasons, under some circumstances (`threading` module usage in app?)
 //       this gets shared across threads. So it can't be `unsendable` (yet?).
@@ -32,20 +26,6 @@ impl WSGIProtocol {
     }
 }
 
-macro_rules! headers_from_py {
-    ($headers:expr) => {{
-        let mut headers = HeaderMap::with_capacity($headers.len() + 3);
-        for (key, value) in $headers {
-            headers.append(
-                HeaderName::from_bytes(key.as_bytes()).unwrap(),
-                HeaderValue::from_str(&value).unwrap(),
-            );
-        }
-        headers.entry(HK_SERVER).or_insert(HV_SERVER);
-        headers
-    }};
-}
-
 #[pymethods]
 impl WSGIProtocol {
     fn response_bytes(&self, status: u16, headers: Vec<(PyBackedStr, PyBackedStr)>, body: Cow<[u8]>) {
@@ -54,21 +34,22 @@ impl WSGIProtocol {
             let txbody = http_body_util::Full::new(body::Bytes::from(data))
                 .map_err(|e| match e {})
                 .boxed();
-            let _ = tx.send((status, headers_from_py!(headers), txbody));
+            let _ = tx.send((status, headers_from_py(headers), txbody));
         }
     }
 
     fn response_iter(&self, py: Python, status: u16, headers: Vec<(PyBackedStr, PyBackedStr)>, body: Bound<PyAny>) {
         if let Some(tx) = self.tx.lock().map_or(None, |mut v| v.take()) {
-            let (body_tx, body_rx) = mpsc::unbounded_channel::<body::Bytes>();
+            //: chan capacity 2 (the actual number we need for pipelining) * 2 to have some "margin"
+            let (body_tx, body_rx) = mpsc::channel::<body::Bytes>(4);
 
             let body_stream = http_body_util::StreamBody::new(
-                tokio_stream::wrappers::UnboundedReceiverStream::new(body_rx)
+                tokio_stream::wrappers::ReceiverStream::new(body_rx)
                     .map(body::Frame::data)
                     .map(Result::Ok),
             );
             let txbody = BodyExt::boxed(body_stream);
-            let _ = tx.send((status, headers_from_py!(headers), txbody));
+            let _ = tx.send((status, headers_from_py(headers), txbody));
 
             let mut closed = false;
             loop {
@@ -92,9 +73,16 @@ impl WSGIProtocol {
                         closed = true;
                         None
                     }
-                } && body_tx.send(frame).is_ok()
-                {
-                    continue;
+                } {
+                    match body_tx.try_send(frame) {
+                        Ok(()) => continue,
+                        Err(mpsc::error::TrySendError::Full(frame)) => {
+                            if py.detach(|| body_tx.blocking_send(frame)).is_ok() {
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
 
                 if !closed {

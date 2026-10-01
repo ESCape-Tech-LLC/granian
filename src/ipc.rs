@@ -81,7 +81,7 @@ impl IPCReceiverHandle {
 
             let idx = handle.get().id;
             let mut pyrx = {
-                let guard = sig.get().rx.lock().unwrap();
+                let guard = sig.get().arx.lock().unwrap();
                 guard.clone().unwrap()
             };
 
@@ -111,6 +111,7 @@ impl IPCReceiverHandle {
                 Python::attach(|_| {
                     drop(ipc);
                     drop(metrics_aggregator);
+                    drop(handle);
                 });
             });
 

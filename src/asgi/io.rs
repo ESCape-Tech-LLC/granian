@@ -8,11 +8,13 @@ use hyper::{
 use pyo3::{prelude::*, pybacked::PyBackedBytes, types::PyDict};
 use std::{
     borrow::Cow,
+    pin::Pin,
     sync::{Arc, Mutex, atomic},
+    task::{Context, Poll},
 };
 use tokio::{
     fs::File,
-    sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot},
+    sync::{Mutex as AsyncMutex, Notify, SetOnce, mpsc, oneshot},
 };
 use tokio_tungstenite::tungstenite::{Message, protocol::frame as wsframe};
 use tokio_util::io::ReaderStream;
@@ -34,28 +36,73 @@ const EMPTY_BYTES: Cow<[u8]> = Cow::Borrowed(b"");
 const EMPTY_STRING: String = String::new();
 static WS_SUBPROTO_HNAME: &str = "Sec-WebSocket-Protocol";
 
+struct ResponseBodyStream {
+    inner: mpsc::Receiver<body::Bytes>,
+    closed: Arc<SetOnce<()>>,
+}
+
+impl Drop for ResponseBodyStream {
+    fn drop(&mut self) {
+        _ = self.closed.set(());
+    }
+}
+
+impl body::Body for ResponseBodyStream {
+    type Data = body::Bytes;
+    type Error = anyhow::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<body::Frame<Self::Data>, Self::Error>>> {
+        self.inner
+            .poll_recv(cx)
+            .map(|item| item.map(|data| Ok(body::Frame::data(data))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_closed() && self.inner.is_empty()
+    }
+
+    fn size_hint(&self) -> body::SizeHint {
+        body::SizeHint::default()
+    }
+}
+
+impl ResponseBodyStream {
+    fn new(notify: Arc<SetOnce<()>>) -> (mpsc::Sender<body::Bytes>, Self) {
+        //: chan capacity 2 (the actual number we need for pipelining) * 2 to have some "margin"
+        let (body_tx, body_rx) = mpsc::channel::<body::Bytes>(4);
+        let slf = Self {
+            inner: body_rx,
+            closed: notify,
+        };
+        (body_tx, slf)
+    }
+}
+
 #[pyclass(frozen, module = "granian._granian")]
 pub(crate) struct ASGIHTTPProtocol {
     rt: RuntimeRef,
     tx: Mutex<Option<oneshot::Sender<HTTPResponse>>>,
-    disconnect_guard: Arc<Notify>,
+    disconnect_guard: Arc<SetOnce<()>>,
     request_body: Arc<AsyncMutex<http_body_util::BodyStream<body::Incoming>>>,
     response_started: atomic::AtomicBool,
     response_chunked: atomic::AtomicBool,
     response_intent: Mutex<Option<(u16, HeaderMap)>>,
-    body_tx: Mutex<Option<mpsc::UnboundedSender<body::Bytes>>>,
+    body_tx: Mutex<Option<mpsc::Sender<body::Bytes>>>,
     flow_rx_exhausted: Arc<atomic::AtomicBool>,
     flow_rx_closed: Arc<atomic::AtomicBool>,
-    flow_tx_waiter: Arc<Notify>,
+    flow_tx_waiter: Arc<SetOnce<()>>,
     sent_response_code: Arc<atomic::AtomicU16>,
 }
 
 impl ASGIHTTPProtocol {
     pub fn new(
         rt: RuntimeRef,
+        disconnect_guard: Arc<SetOnce<()>>,
         body: hyper::body::Incoming,
         tx: oneshot::Sender<HTTPResponse>,
-        disconnect_guard: Arc<Notify>,
     ) -> Self {
         Self {
             rt,
@@ -68,7 +115,7 @@ impl ASGIHTTPProtocol {
             body_tx: Mutex::new(None),
             flow_rx_exhausted: Arc::new(atomic::AtomicBool::new(false)),
             flow_rx_closed: Arc::new(atomic::AtomicBool::new(false)),
-            flow_tx_waiter: Arc::new(tokio::sync::Notify::new()),
+            flow_tx_waiter: Arc::new(SetOnce::new()),
             sent_response_code: Arc::new(atomic::AtomicU16::new(500)),
         }
     }
@@ -88,21 +135,43 @@ impl ASGIHTTPProtocol {
     fn send_body<'p>(
         &self,
         py: Python<'p>,
-        tx: &mpsc::UnboundedSender<body::Bytes>,
+        tx: mpsc::Sender<body::Bytes>,
         body: Box<[u8]>,
         close: bool,
     ) -> PyResult<Bound<'p, PyAny>> {
-        match tx.send(body.into()) {
+        let frame = body.into();
+        match tx.try_send(frame) {
             Ok(()) => {
                 if close {
-                    self.flow_tx_waiter.notify_one();
+                    _ = self.flow_tx_waiter.set(());
                 }
+            }
+            Err(mpsc::error::TrySendError::Full(frame)) => {
+                let tx_waiter = self.flow_tx_waiter.clone();
+                let rx_closed = self.flow_rx_closed.clone();
+
+                return future_into_py_futlike(self.rt.clone(), py, async move {
+                    match tx.send(frame).await {
+                        Ok(()) => {
+                            if close {
+                                _ = tx_waiter.set(());
+                            }
+                        }
+                        Err(err) => {
+                            if !rx_closed.load(atomic::Ordering::Acquire) {
+                                log::info!("ASGI transport error: {err:?}");
+                            }
+                            _ = tx_waiter.set(());
+                        }
+                    }
+                    FutureResultToPy::None
+                });
             }
             Err(err) => {
                 if !self.flow_rx_closed.load(atomic::Ordering::Acquire) {
                     log::info!("ASGI transport error: {err:?}");
                 }
-                self.flow_tx_waiter.notify_one();
+                _ = self.flow_tx_waiter.set(());
             }
         }
 
@@ -130,8 +199,8 @@ impl ASGIHTTPProtocol {
             let disconnected = self.flow_rx_closed.clone();
             return future_into_py_futlike(self.rt.clone(), py, async move {
                 tokio::select! {
-                    () = guard_tx.notified() => {},
-                    () = guard_disconnect.notified() => disconnected.store(true, atomic::Ordering::Release),
+                    () = guard_tx.wait() => {},
+                    () = guard_disconnect.wait() => disconnected.store(true, atomic::Ordering::Release),
                 }
                 FutureResultToPy::ASGIMessage(ASGIMessageType::HTTPDisconnect)
             });
@@ -157,7 +226,7 @@ impl ASGIHTTPProtocol {
                     Some(Err(_)) => None,
                     _ => Some(body::Bytes::new()),
                 },
-                () = guard_disconnect.notified() => {
+                () = guard_disconnect.wait() => {
                     disconnected.store(true, atomic::Ordering::Release);
                     None
                 }
@@ -169,7 +238,7 @@ impl ASGIHTTPProtocol {
             match chunk {
                 Some(data) => FutureResultToPy::ASGIMessage(ASGIMessageType::HTTPRequestBody((data, more_body))),
                 _ => {
-                    guard_tx.notify_one();
+                    _ = guard_tx.set(());
                     FutureResultToPy::ASGIMessage(ASGIMessageType::HTTPDisconnect)
                 }
             }
@@ -202,12 +271,7 @@ impl ASGIHTTPProtocol {
 
                 self.response_chunked.store(true, atomic::Ordering::Relaxed);
                 let (status, headers) = intent;
-                let (body_tx, body_rx) = mpsc::unbounded_channel::<body::Bytes>();
-                let body_stream = http_body_util::StreamBody::new(
-                    tokio_stream::wrappers::UnboundedReceiverStream::new(body_rx)
-                        .map(body::Frame::data)
-                        .map(Result::Ok),
-                );
+                let (body_tx, body_stream) = ResponseBodyStream::new(self.disconnect_guard.clone());
                 *self.body_tx.lock().unwrap() = Some(body_tx.clone());
                 self.send_response(status, headers, BodyExt::boxed(body_stream));
                 empty_future_into_py(py)
@@ -227,7 +291,7 @@ impl ASGIHTTPProtocol {
                                     .map_err(std::convert::Into::into)
                                     .boxed(),
                             );
-                            self.flow_tx_waiter.notify_one();
+                            _ = self.flow_tx_waiter.set(());
                             empty_future_into_py(py)
                         }
                         _ => error_flow!("Response already finished"),
@@ -235,27 +299,22 @@ impl ASGIHTTPProtocol {
                     (true, true, false) => match self.response_intent.lock().unwrap().take() {
                         Some((status, headers)) => {
                             self.response_chunked.store(true, atomic::Ordering::Relaxed);
-                            let (body_tx, body_rx) = mpsc::unbounded_channel::<body::Bytes>();
-                            let body_stream = http_body_util::StreamBody::new(
-                                tokio_stream::wrappers::UnboundedReceiverStream::new(body_rx)
-                                    .map(body::Frame::data)
-                                    .map(Result::Ok),
-                            );
+                            let (body_tx, body_stream) = ResponseBodyStream::new(self.disconnect_guard.clone());
                             *self.body_tx.lock().unwrap() = Some(body_tx.clone());
                             self.send_response(status, headers, BodyExt::boxed(body_stream));
-                            self.send_body(py, &body_tx, body, false)
+                            self.send_body(py, body_tx, body, false)
                         }
                         _ => error_flow!("Response already finished"),
                     },
                     (true, true, true) => match &*self.body_tx.lock().unwrap() {
-                        Some(tx) => self.send_body(py, tx, body, false),
+                        Some(tx) => self.send_body(py, tx.clone(), body, false),
                         _ => error_flow!("Transport not initialized or closed"),
                     },
                     (true, false, true) => match self.body_tx.lock().unwrap().take() {
                         Some(tx) => match body.is_empty() {
-                            false => self.send_body(py, &tx, body, true),
+                            false => self.send_body(py, tx, body, true),
                             true => {
-                                self.flow_tx_waiter.notify_one();
+                                _ = self.flow_tx_waiter.set(());
                                 empty_future_into_py(py)
                             }
                         },
@@ -285,12 +344,13 @@ impl ASGIHTTPProtocol {
                                 res
                             }
                             Err(_) => {
-                                log::info!("Cannot open file {}", &file_path);
+                                log::info!("Cannot open file {file_path}");
                                 response_404()
                             }
                         };
                         let _ = tx.send(res);
                     });
+                    _ = self.flow_tx_waiter.set(());
                     empty_future_into_py(py)
                 }
                 _ => error_flow!("Response not started"),
@@ -387,6 +447,7 @@ impl ASGIWebsocketProtocol {
         let websocket = self.websocket.lock().unwrap().take();
         let accepted = self.init_tx.clone();
         let accept_notify = self.init_event.clone();
+        let closed = self.closed.clone();
         let rx = self.ws_rx.clone();
         let tx = self.ws_tx.clone();
 
@@ -410,6 +471,12 @@ impl ASGIWebsocketProtocol {
                     accept_notify.notify_one();
                     return FutureResultToPy::None;
                 }
+
+                // connection was closed before upgrade
+                closed.store(true, atomic::Ordering::Release);
+                accepted.store(true, atomic::Ordering::Release);
+                accept_notify.notify_one();
+                return FutureResultToPy::None;
             }
             FutureResultToPy::Err(error_flow!("Connection already upgraded"))
         })
@@ -455,9 +522,14 @@ impl ASGIWebsocketProtocol {
 
     #[inline(always)]
     fn send_message<'p>(&self, py: Python<'p>, data: Message) -> PyResult<Bound<'p, PyAny>> {
+        if self.closed.load(atomic::Ordering::Acquire) {
+            //: ASGI spec 2.3 => no error
+            // return err_future_into_py(py, error_flow!("Transport closed"));
+            return empty_future_into_py(py);
+        }
+
         let transport = self.ws_tx.clone();
         let closed = self.closed.clone();
-
         future_into_py_futlike(self.rt.clone(), py, async move {
             if let Some(ws) = &mut *(transport.lock().await) {
                 match ws.send(data).await {
@@ -470,7 +542,9 @@ impl ASGIWebsocketProtocol {
                     }
                 }
             }
-            FutureResultToPy::Err(error_flow!("Transport not initialized or closed"))
+            //: ASGI spec 2.3 => no error
+            // FutureResultToPy::Err(error_flow!("Transport not initialized or closed"))
+            FutureResultToPy::None
         })
     }
 
@@ -503,11 +577,12 @@ impl ASGIWebsocketProtocol {
         Option<oneshot::Sender<WebsocketDetachedTransport>>,
         WebsocketDetachedTransport,
     ) {
-        let mut ws_rx = self.ws_rx.blocking_lock();
-        let mut ws_tx = self.ws_tx.blocking_lock();
+        self.closed.store(true, atomic::Ordering::Release);
+        let ws_rx = self.ws_rx.try_lock().map_or(None, |mut guard| guard.take());
+        let ws_tx = self.ws_tx.try_lock().map_or(None, |mut guard| guard.take());
         (
             self.tx.lock().unwrap().take(),
-            WebsocketDetachedTransport::new(self.consumed(), ws_rx.take(), ws_tx.take(), None),
+            WebsocketDetachedTransport::new(self.consumed(), ws_rx, ws_tx, None),
         )
     }
 }
@@ -521,6 +596,13 @@ impl ASGIWebsocketProtocol {
             .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
             .is_ok()
         {
+            // unless the connection was closed
+            if self.closed.load(atomic::Ordering::Acquire) {
+                return done_future_into_py(
+                    py,
+                    super::conversion::message_into_py(py, ASGIMessageType::WSClose(None)).map(Bound::unbind),
+                );
+            }
             return done_future_into_py(
                 py,
                 super::conversion::message_into_py(py, ASGIMessageType::WSConnect).map(Bound::unbind),
@@ -597,7 +679,7 @@ fn adapt_message_type(py: Python, message: &Bound<PyDict>) -> Result<ASGIMessage
                 "http.response.pathsend" => Ok(ASGIMessageType::HTTPResponseFile(adapt_file(py, message)?)),
                 "websocket.accept" => {
                     let subproto: Option<String> = match message.get_item(pyo3::intern!(py, "subprotocol")) {
-                        Ok(Some(item)) => item.extract::<String>().map(Some).unwrap_or(None),
+                        Ok(Some(item)) => item.extract::<String>().ok(),
                         _ => None,
                     };
                     Ok(ASGIMessageType::WSAccept(subproto))
@@ -606,8 +688,7 @@ fn adapt_message_type(py: Python, message: &Bound<PyDict>) -> Result<ASGIMessage
                     let code: wsframe::coding::CloseCode = match message.get_item(pyo3::intern!(py, "code")) {
                         Ok(Some(item)) => item
                             .extract::<u16>()
-                            .map(std::convert::Into::into)
-                            .unwrap_or(wsframe::coding::CloseCode::Normal),
+                            .map_or(wsframe::coding::CloseCode::Normal, std::convert::Into::into),
                         _ => wsframe::coding::CloseCode::Normal,
                     };
                     let reason: String = match message.get_item(pyo3::intern!(py, "reason")) {

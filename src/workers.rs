@@ -16,54 +16,45 @@ use super::wsgi::serve::WSGIWorker;
 
 #[pyclass(frozen, module = "granian._granian")]
 pub(crate) struct WorkerSignal {
-    pub rx: Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
-    tx: tokio::sync::watch::Sender<bool>,
+    pub rx: Mutex<Option<crossbeam_channel::Receiver<bool>>>,
+    tx: crossbeam_channel::Sender<bool>,
+    pub arx: Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
+    atx: tokio::sync::watch::Sender<bool>,
+    cb: Mutex<Option<Py<PyAny>>>,
+}
+
+impl WorkerSignal {
+    pub fn release(&self, py: Python) -> PyResult<Py<PyAny>> {
+        match self.cb.lock().unwrap().take() {
+            Some(cb) => cb.call0(py),
+            None => Ok(py.None()),
+        }
+    }
 }
 
 #[pymethods]
 impl WorkerSignal {
     #[new]
     fn new() -> Self {
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        Self {
-            rx: Mutex::new(Some(rx)),
-            tx,
-        }
-    }
-
-    fn set(&self) {
-        let _ = self.tx.send(true);
-    }
-}
-
-#[pyclass(frozen, module = "granian._granian")]
-pub(crate) struct WorkerSignalSync {
-    pub rx: Mutex<Option<crossbeam_channel::Receiver<bool>>>,
-    tx: crossbeam_channel::Sender<bool>,
-    #[pyo3(get)]
-    pub qs: Py<PyAny>,
-}
-
-impl WorkerSignalSync {
-    pub fn release(&self, py: Python) -> PyResult<Py<PyAny>> {
-        self.qs.call_method0(py, "set")
-    }
-}
-
-#[pymethods]
-impl WorkerSignalSync {
-    #[new]
-    fn new(qs: Py<PyAny>) -> Self {
         let (tx, rx) = crossbeam_channel::bounded(1);
+        let (atx, arx) = tokio::sync::watch::channel(false);
         Self {
             rx: Mutex::new(Some(rx)),
             tx,
-            qs,
+            arx: Mutex::new(Some(arx)),
+            atx,
+            cb: Mutex::new(None),
         }
     }
 
+    fn add_cb(&self, cb: Py<PyAny>) {
+        let mut guard = self.cb.lock().unwrap();
+        *guard = Some(cb);
+    }
+
     fn set(&self) {
-        let _ = self.tx.send(true);
+        _ = self.tx.send(true);
+        _ = self.atx.send(true);
     }
 }
 
@@ -90,7 +81,10 @@ pub(crate) struct HTTP2Config {
 
 pub(crate) struct WorkerConfig {
     pub id: i32,
-    sock: Py<crate::net::SocketHolder>,
+    sock: (
+        Option<Py<crate::net::ListenerSpec>>,
+        Option<Py<crate::net::SocketHolder>>,
+    ),
     #[cfg(not(Py_GIL_DISABLED))]
     pub ipc: Option<Py<crate::ipc::IPCSenderHandle>>,
     pub threads: usize,
@@ -123,7 +117,10 @@ pub(crate) struct WorkerTlsConfig {
 impl WorkerConfig {
     pub fn new(
         id: i32,
-        sock: Py<crate::net::SocketHolder>,
+        sock: (
+            Option<Py<crate::net::ListenerSpec>>,
+            Option<Py<crate::net::SocketHolder>>,
+        ),
         #[allow(unused_variables)] ipc: Option<Py<crate::ipc::IPCSenderHandle>>,
         threads: usize,
         blocking_threads: usize,
@@ -178,14 +175,18 @@ impl WorkerConfig {
     }
 
     pub fn tcp_listener(&self) -> std::net::TcpListener {
-        let listener = self.sock.get().as_tcp_listener().unwrap();
+        let listener = if let Some(sock) = &self.sock.1 {
+            sock.get().as_tcp_listener().unwrap()
+        } else {
+            self.sock.0.as_ref().unwrap().get().as_listener().unwrap()
+        };
         _ = listener.set_nonblocking(true);
         listener
     }
 
     #[cfg(unix)]
     pub fn uds_listener(&self) -> std::os::unix::net::UnixListener {
-        let listener = self.sock.get().as_unix_listener().unwrap();
+        let listener = self.sock.1.as_ref().unwrap().get().as_unix_listener().unwrap();
         _ = listener.set_nonblocking(true);
         listener
     }
@@ -301,7 +302,6 @@ impl<C, A, H, F, M, Ret> Worker<C, A, H, F, M>
 where
     F: Fn(
             crate::runtime::RuntimeRef,
-            Arc<tokio::sync::Notify>,
             crate::callbacks::ArcCBScheduler,
             crate::net::SockAddr,
             crate::net::SockAddr,
@@ -329,7 +329,6 @@ struct WorkerSvc<F, C, P> {
     f: F,
     ctx: C,
     rt: crate::runtime::RuntimeRef,
-    disconnect_guard: Arc<tokio::sync::Notify>,
     addr_local: crate::net::SockAddr,
     addr_remote: crate::net::SockAddr,
     _proto: PhantomData<P>,
@@ -339,7 +338,6 @@ macro_rules! service_proto_fut {
     ($proto:expr, $self:expr, $req:expr) => {{
         let fut = ($self.f)(
             $self.rt.clone(),
-            $self.disconnect_guard.clone(),
             $self.ctx.callback.clone(),
             $self.addr_local.clone(),
             $self.addr_remote.clone(),
@@ -357,7 +355,6 @@ macro_rules! service_impl {
         where
             F: Fn(
                     crate::runtime::RuntimeRef,
-                    Arc<tokio::sync::Notify>,
                     crate::callbacks::ArcCBScheduler,
                     crate::net::SockAddr,
                     crate::net::SockAddr,
@@ -384,7 +381,6 @@ macro_rules! service_impl {
         where
             F: Fn(
                     crate::runtime::RuntimeRef,
-                    Arc<tokio::sync::Notify>,
                     crate::callbacks::ArcCBScheduler,
                     crate::net::SockAddr,
                     crate::net::SockAddr,
@@ -425,7 +421,6 @@ macro_rules! service_impl {
         where
             F: Fn(
                     crate::runtime::RuntimeRef,
-                    Arc<tokio::sync::Notify>,
                     crate::callbacks::ArcCBScheduler,
                     crate::net::SockAddr,
                     crate::net::SockAddr,
@@ -446,7 +441,7 @@ macro_rules! service_impl {
                 self.ctx
                     .metrics
                     .req_handled
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 service_proto_fut!($proto, self, req)
             }
         }
@@ -456,7 +451,6 @@ macro_rules! service_impl {
         where
             F: Fn(
                     crate::runtime::RuntimeRef,
-                    Arc<tokio::sync::Notify>,
                     crate::callbacks::ArcCBScheduler,
                     crate::net::SockAddr,
                     crate::net::SockAddr,
@@ -477,7 +471,7 @@ macro_rules! service_impl {
                 self.ctx
                     .metrics
                     .req_handled
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                 if let Some(static_match) = crate::files::match_static_file(
                     req.uri().path(),
@@ -487,12 +481,12 @@ macro_rules! service_impl {
                     self.ctx
                         .metrics
                         .req_static_handled
-                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if static_match.is_err() {
                         self.ctx
                             .metrics
                             .req_static_err
-                            .fetch_add(1, std::sync::atomic::Ordering::Release);
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return Box::pin(async move { Ok::<_, hyper::Error>(crate::http::response_404()) });
                     }
                     let expires = self.ctx.static_expires.clone();
@@ -551,27 +545,24 @@ pub(crate) struct WorkerHandlerHA<U, M> {
 
 struct WorkerHandleH1<U, M> {
     opts: HTTP1Config,
-    guard: Arc<tokio::sync::Notify>,
     metrics: M,
     _upgrades: PhantomData<U>,
 }
 
 struct WorkerHandleH2<M> {
     opts: HTTP2Config,
-    guard: Arc<tokio::sync::Notify>,
     metrics: M,
 }
 
 struct WorkerHandleHA<U, M> {
     opts_h1: HTTP1Config,
     opts_h2: HTTP2Config,
-    guard: Arc<tokio::sync::Notify>,
     metrics: M,
     _upgrades: PhantomData<U>,
 }
 
 trait WorkerHandleBuilder<I, S> {
-    fn handle(&self, guard: Arc<tokio::sync::Notify>) -> impl WorkerHandle<I, S>;
+    fn handle(&self) -> impl WorkerHandle<I, S>;
 }
 
 impl<C, A, F, M, I, S> WorkerHandleBuilder<I, S> for Worker<C, A, WorkerHandlerH1<WorkerMarkerConnNoUpgrades, M>, F, M>
@@ -583,10 +574,9 @@ where
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     WorkerHandleH1<WorkerMarkerConnNoUpgrades, M>: WorkerHandle<I, S>,
 {
-    fn handle(&self, guard: Arc<tokio::sync::Notify>) -> impl WorkerHandle<I, S> {
+    fn handle(&self) -> impl WorkerHandle<I, S> {
         WorkerHandleH1 {
             opts: self.handler.opts.clone(),
-            guard,
             metrics: self.handler.metrics.clone(),
             _upgrades: PhantomData::<WorkerMarkerConnNoUpgrades>,
         }
@@ -602,10 +592,9 @@ where
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     WorkerHandleH1<WorkerMarkerConnUpgrades, M>: WorkerHandle<I, S>,
 {
-    fn handle(&self, guard: Arc<tokio::sync::Notify>) -> impl WorkerHandle<I, S> {
+    fn handle(&self) -> impl WorkerHandle<I, S> {
         WorkerHandleH1 {
             opts: self.handler.opts.clone(),
-            guard,
             metrics: self.handler.metrics.clone(),
             _upgrades: PhantomData::<WorkerMarkerConnUpgrades>,
         }
@@ -621,10 +610,9 @@ where
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     WorkerHandleH2<M>: WorkerHandle<I, S>,
 {
-    fn handle(&self, guard: Arc<tokio::sync::Notify>) -> impl WorkerHandle<I, S> {
+    fn handle(&self) -> impl WorkerHandle<I, S> {
         WorkerHandleH2 {
             opts: self.handler.opts.clone(),
-            guard,
             metrics: self.handler.metrics.clone(),
         }
     }
@@ -639,11 +627,10 @@ where
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     WorkerHandleHA<WorkerMarkerConnNoUpgrades, M>: WorkerHandle<I, S>,
 {
-    fn handle(&self, guard: Arc<tokio::sync::Notify>) -> impl WorkerHandle<I, S> {
+    fn handle(&self) -> impl WorkerHandle<I, S> {
         WorkerHandleHA {
             opts_h1: self.handler.opts_h1.clone(),
             opts_h2: self.handler.opts_h2.clone(),
-            guard,
             metrics: self.handler.metrics.clone(),
             _upgrades: PhantomData::<WorkerMarkerConnNoUpgrades>,
         }
@@ -659,11 +646,10 @@ where
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     WorkerHandleHA<WorkerMarkerConnUpgrades, M>: WorkerHandle<I, S>,
 {
-    fn handle(&self, guard: Arc<tokio::sync::Notify>) -> impl WorkerHandle<I, S> {
+    fn handle(&self) -> impl WorkerHandle<I, S> {
         WorkerHandleHA {
             opts_h1: self.handler.opts_h1.clone(),
             opts_h2: self.handler.opts_h2.clone(),
-            guard,
             metrics: self.handler.metrics.clone(),
             _upgrades: PhantomData::<WorkerMarkerConnUpgrades>,
         }
@@ -676,7 +662,7 @@ trait WorkerHandle<I, S> {
         svc: S,
         stream: I,
         permit: tokio::sync::OwnedSemaphorePermit,
-        sig: Arc<tokio::sync::Notify>,
+        sig: Arc<tokio::sync::SetOnce<bool>>,
     ) -> impl Future<Output = ()> + Send + 'static;
 }
 
@@ -691,7 +677,7 @@ macro_rules! conn_handle_h1_impl {
             _ = conn.as_mut() => {
                 done = true;
             },
-            _ = $sig.notified() => {
+            _ = $sig.wait() => {
                 conn.as_mut().graceful_shutdown();
             }
         }
@@ -699,7 +685,6 @@ macro_rules! conn_handle_h1_impl {
             _ = conn.as_mut().await;
         }
 
-        $self.guard.notify_one();
         drop($permit);
     }};
 }
@@ -735,7 +720,7 @@ macro_rules! conn_handle_ha_impl {
             _ = conn.as_mut() => {
                 done = true;
             },
-            _ = $sig.notified() => {
+            _ = $sig.wait() => {
                 conn.as_mut().graceful_shutdown();
             }
         }
@@ -743,7 +728,6 @@ macro_rules! conn_handle_ha_impl {
             _ = conn.as_mut().await;
         }
 
-        $self.guard.notify_one();
         drop($permit);
     }};
 }
@@ -770,7 +754,7 @@ macro_rules! conn_handle_h2_impl {
             _ = conn.as_mut() => {
                 done = true;
             },
-            () = $sig.notified() => {
+            _ = $sig.wait() => {
                 conn.as_mut().graceful_shutdown();
             }
         }
@@ -778,7 +762,6 @@ macro_rules! conn_handle_h2_impl {
             _ = conn.as_mut().await;
         }
 
-        $self.guard.notify_one();
         drop($permit);
     }};
 }
@@ -790,7 +773,7 @@ macro_rules! conn_handle_h1 {
             svc: S,
             stream: I,
             permit: tokio::sync::OwnedSemaphorePermit,
-            sig: Arc<tokio::sync::Notify>,
+            sig: Arc<tokio::sync::SetOnce<bool>>,
         ) {
             conn_handle_h1_impl!($cb, self, svc, stream, permit, sig)
         }
@@ -801,15 +784,15 @@ macro_rules! conn_handle_h1 {
             svc: S,
             stream: I,
             permit: tokio::sync::OwnedSemaphorePermit,
-            sig: Arc<tokio::sync::Notify>,
+            sig: Arc<tokio::sync::SetOnce<bool>>,
         ) {
             self.metrics
                 .conn_active
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             conn_handle_h1_impl!($cb, self, svc, stream, permit, sig);
             self.metrics
                 .conn_active
-                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     };
 }
@@ -821,7 +804,7 @@ macro_rules! conn_handle_ha {
             svc: S,
             stream: I,
             permit: tokio::sync::OwnedSemaphorePermit,
-            sig: Arc<tokio::sync::Notify>,
+            sig: Arc<tokio::sync::SetOnce<bool>>,
         ) {
             conn_handle_ha_impl!($conn_method, self, svc, stream, permit, sig)
         }
@@ -832,15 +815,15 @@ macro_rules! conn_handle_ha {
             svc: S,
             stream: I,
             permit: tokio::sync::OwnedSemaphorePermit,
-            sig: Arc<tokio::sync::Notify>,
+            sig: Arc<tokio::sync::SetOnce<bool>>,
         ) {
             self.metrics
                 .conn_active
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             conn_handle_ha_impl!($conn_method, self, svc, stream, permit, sig);
             self.metrics
                 .conn_active
-                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     };
 }
@@ -911,7 +894,13 @@ where
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    async fn call(self, svc: S, stream: I, permit: tokio::sync::OwnedSemaphorePermit, sig: Arc<tokio::sync::Notify>) {
+    async fn call(
+        self,
+        svc: S,
+        stream: I,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        sig: Arc<tokio::sync::SetOnce<bool>>,
+    ) {
         conn_handle_h2_impl!(self, svc, stream, permit, sig);
     }
 }
@@ -923,14 +912,20 @@ where
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    async fn call(self, svc: S, stream: I, permit: tokio::sync::OwnedSemaphorePermit, sig: Arc<tokio::sync::Notify>) {
+    async fn call(
+        self,
+        svc: S,
+        stream: I,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        sig: Arc<tokio::sync::SetOnce<bool>>,
+    ) {
         self.metrics
             .conn_active
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         conn_handle_h2_impl!(self, svc, stream, permit, sig);
         self.metrics
             .conn_active
-            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -963,13 +958,11 @@ pub(crate) trait WorkerAcceptor<L> {
 
 macro_rules! acceptor_impl_stream {
     ($proto_marker:ty, $sockwrap:expr, $stream:expr, $addr_remote:expr, $self:expr, $addr_local:expr, $rt:expr, $tasks:expr, $permit:expr, $connsig:expr, $target:expr, $ctx:expr) => {{
-        let disconnect_guard = Arc::new(tokio::sync::Notify::new());
-        let handle = $self.handle(disconnect_guard.clone());
+        let handle = $self.handle();
         let svc = WorkerSvc {
             f: $target,
             ctx: $ctx,
             rt: $rt,
-            disconnect_guard,
             addr_local: $addr_local.clone(),
             addr_remote: $sockwrap($addr_remote),
             _proto: PhantomData::<$proto_marker>,
@@ -980,7 +973,7 @@ macro_rules! acceptor_impl_stream {
 
 macro_rules! acceptor_impl_err {
     ($err:expr, $permit:expr) => {{
-        log::info!("TCP handshake failed with error: {:?}", $err);
+        log::debug!("TCP handshake failed with error: {:?}", $err);
         drop($permit);
     }};
 }
@@ -1014,7 +1007,7 @@ macro_rules! acceptor_impl_match_metrics {
                 $self
                     .metrics
                     .conn_handled
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 acceptor_impl_stream!(
                     $proto_marker,
                     $sockwrap,
@@ -1034,7 +1027,7 @@ macro_rules! acceptor_impl_match_metrics {
                 $self
                     .metrics
                     .conn_err
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 acceptor_impl_err!(err, $permit)
             }
         }
@@ -1044,7 +1037,7 @@ macro_rules! acceptor_impl_match_metrics {
 macro_rules! acceptor_impl_loop {
     ($proto_marker:ty, $sockwrap:expr, $matchi:ident, $self:expr, $sig:expr, $backpressure:expr, $listener:expr, $addr_local:expr) => {{
         let semaphore = Arc::new(tokio::sync::Semaphore::new($backpressure));
-        let connsig = Arc::new(tokio::sync::Notify::new());
+        let connsig = Arc::new(tokio::sync::SetOnce::new());
         let mut accept_loop = true;
 
         while accept_loop {
@@ -1075,7 +1068,7 @@ macro_rules! acceptor_impl_loop {
                 ),
                 _ = $sig.changed() => {
                     accept_loop = false;
-                    connsig.notify_waiters();
+                    _ = connsig.set(true);
                 }
             }
         }
@@ -1088,7 +1081,6 @@ macro_rules! acceptor_impl {
         where
             F: Fn(
                     crate::runtime::RuntimeRef,
-                    Arc<tokio::sync::Notify>,
                     crate::callbacks::ArcCBScheduler,
                     crate::net::SockAddr,
                     crate::net::SockAddr,
@@ -1121,7 +1113,6 @@ macro_rules! acceptor_impl {
         where
             F: Fn(
                     crate::runtime::RuntimeRef,
-                    Arc<tokio::sync::Notify>,
                     crate::callbacks::ArcCBScheduler,
                     crate::net::SockAddr,
                     crate::net::SockAddr,
@@ -1155,7 +1146,6 @@ macro_rules! acceptor_impl {
         where
             F: Fn(
                     crate::runtime::RuntimeRef,
-                    Arc<tokio::sync::Notify>,
                     crate::callbacks::ArcCBScheduler,
                     crate::net::SockAddr,
                     crate::net::SockAddr,
@@ -1188,7 +1178,6 @@ macro_rules! acceptor_impl {
         where
             F: Fn(
                     crate::runtime::RuntimeRef,
-                    Arc<tokio::sync::Notify>,
                     crate::callbacks::ArcCBScheduler,
                     crate::net::SockAddr,
                     crate::net::SockAddr,
@@ -1242,7 +1231,6 @@ acceptor_impl!(
 
 pub(crate) fn init_pymodule(module: &Bound<PyModule>) -> PyResult<()> {
     module.add_class::<WorkerSignal>()?;
-    module.add_class::<WorkerSignalSync>()?;
     module.add_class::<ASGIWorker>()?;
     module.add_class::<RSGIWorker>()?;
     module.add_class::<WSGIWorker>()?;
