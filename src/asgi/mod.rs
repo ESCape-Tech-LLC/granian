@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 mod callbacks;
 pub(crate) mod conversion;
 mod errors;
+mod heartbeat;
 mod http;
 mod io;
 pub(crate) mod serve;

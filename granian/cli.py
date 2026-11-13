@@ -129,6 +129,33 @@ def option(*param_decls: str, cls: type[click.Option] | None = None, **attrs: An
 )
 @option('--http', type=EnumType(HTTPModes), default=HTTPModes.auto, help='HTTP version')
 @option('--ws/--no-ws', 'websockets', default=True, help='Enable websockets handling')
+@option(
+    '--ws-ping-interval',
+    'websocket_ping_interval',
+    type=click.FloatRange(min=0, min_open=True),
+    help='ASGI WebSocket Ping interval in seconds',
+)
+@option(
+    '--ws-heartbeat-path',
+    'websocket_heartbeat_paths',
+    multiple=True,
+    metavar='PATH',
+    help='Restrict ASGI WebSocket heartbeat to an exact request path. Repeat for multiple paths',
+)
+@option(
+    '--ws-ping-timeout',
+    'websocket_ping_timeout',
+    type=click.FloatRange(min=0, min_open=True),
+    default=10.0,
+    help='ASGI WebSocket Ping/Pong timeout in seconds',
+)
+@option(
+    '--ws-close-timeout',
+    'websocket_close_timeout',
+    type=click.FloatRange(min=0, min_open=True),
+    default=5.0,
+    help='ASGI WebSocket closing timeout in seconds',
+)
 @option('--workers', type=click.IntRange(1), default=1, help='Number of worker processes')
 @option(
     '--blocking-threads',
@@ -441,6 +468,10 @@ def cli(
     interface: Interfaces,
     http: HTTPModes,
     websockets: bool,
+    websocket_ping_interval: float | None,
+    websocket_heartbeat_paths: tuple[str, ...],
+    websocket_ping_timeout: float,
+    websocket_close_timeout: float,
     workers: int,
     blocking_threads: int | None,
     blocking_threads_idle_timeout: int,
@@ -505,6 +536,9 @@ def cli(
     process_name: str | None,
     pid_file: pathlib.Path | None,
 ) -> None:
+    if websocket_heartbeat_paths and websocket_ping_interval is None:
+        raise click.UsageError('--ws-heartbeat-path requires --ws-ping-interval')
+
     log_dictconfig = None
     if log_config:
         with log_config.open() as log_config_file:
@@ -535,6 +569,10 @@ def cli(
         task_impl=task_impl,
         http=http,
         websockets=websockets,
+        websocket_ping_interval=websocket_ping_interval,
+        websocket_heartbeat_paths=websocket_heartbeat_paths,
+        websocket_ping_timeout=websocket_ping_timeout,
+        websocket_close_timeout=websocket_close_timeout,
         backlog=backlog,
         backpressure=backpressure,
         http1_settings=HTTP1Settings(

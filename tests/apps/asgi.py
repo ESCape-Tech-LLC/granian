@@ -1,6 +1,7 @@
 import asyncio
 import json
 import pathlib
+from urllib.parse import parse_qs
 
 import sniffio
 
@@ -144,6 +145,29 @@ async def ws_push(scope, receive, send):
         pass
 
 
+async def ws_heartbeat(scope, receive, send):
+    await receive()
+    await send({'type': 'websocket.accept'})
+    options = parse_qs(scope['query_string'].decode('ascii'))
+    if 'manual_after_message' in options:
+        message = await receive()
+        if message['type'] == 'websocket.disconnect':
+            return
+        await send({'type': 'websocket.ping'})
+    elif 'manual' in options:
+        await send({'type': 'websocket.ping'})
+    if 'blocked_write' in options:
+        await send({'type': 'websocket.send', 'bytes': b'x' * (16 * 1024 * 1024)})
+    else:
+        # Keep the application away from receive while Granian reads control frames.
+        await asyncio.sleep(3)
+
+    while (await receive())['type'] != 'websocket.disconnect':
+        pass
+    if 'marker' in options:
+        pathlib.Path(options['marker'][0]).touch()
+
+
 async def ws_close(scope, receive, send):
     await receive()
     await send({'type': 'websocket.accept'})
@@ -226,6 +250,9 @@ def app(scope, receive, send):
         '/ws_rejectc': ws_reject_custom,
         '/ws_info': ws_info,
         '/ws_echo': ws_echo,
+        '/ws_heartbeat': ws_heartbeat,
+        '/api/v4/ws': ws_heartbeat,
+        '/api/v4/ws/legacy': ws_echo,
         '/ws_close': ws_close,
         '/ws_push': ws_push,
         '/err_app': err_app,

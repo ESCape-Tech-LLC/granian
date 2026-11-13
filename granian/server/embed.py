@@ -128,6 +128,10 @@ class Server(AbstractServer[AsyncWorker]):
         static_path_mount: Sequence[Path] | None = None,
         static_path_dir_to_file: str | None = None,
         static_path_expires: int = 86400,
+        websocket_ping_interval: float | None = None,
+        websocket_ping_timeout: float = 10,
+        websocket_close_timeout: float = 5,
+        websocket_heartbeat_paths: Sequence[str] | None = None,
     ):
         super().__init__(
             target=target,
@@ -142,6 +146,10 @@ class Server(AbstractServer[AsyncWorker]):
             task_impl=task_impl,
             http=http,
             websockets=websockets,
+            websocket_ping_interval=websocket_ping_interval,
+            websocket_ping_timeout=websocket_ping_timeout,
+            websocket_close_timeout=websocket_close_timeout,
+            websocket_heartbeat_paths=websocket_heartbeat_paths,
             backlog=backlog,
             backpressure=backpressure,
             http1_settings=http1_settings,
@@ -193,6 +201,8 @@ class Server(AbstractServer[AsyncWorker]):
                 self.log_access_format if self.log_access else None,
                 self.ssl_ctx,
                 {'url_path_prefix': self.url_path_prefix},
+                *((self.websocket_heartbeat,) if self.websocket_heartbeat is not None else ()),
+                *((self.websocket_heartbeat_paths,) if self.websocket_heartbeat_paths else ()),
             ),
             sig=sig,
         )
@@ -219,6 +229,8 @@ class Server(AbstractServer[AsyncWorker]):
         log_access_fmt: str | None,
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
+        websocket_heartbeat: tuple[float, float, float] | None = None,
+        websocket_heartbeat_paths: tuple[str, ...] = (),
     ):
         wcallback = _future_watcher_wrapper(_asgi_call_wrap(callback, scope_opts, {}, log_access_fmt))
         fut = loop.create_future()
@@ -247,6 +259,8 @@ class Server(AbstractServer[AsyncWorker]):
             static_path,
             *ssl_ctx,
             (None, None),
+            websocket_heartbeat=websocket_heartbeat,
+            websocket_heartbeat_paths=websocket_heartbeat_paths,
         )
         serve = worker.serve_async_uds if (sock[0] or sock[1]).is_uds() else worker.serve_async
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
@@ -275,6 +289,8 @@ class Server(AbstractServer[AsyncWorker]):
         log_access_fmt: str | None,
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
+        websocket_heartbeat: tuple[float, float, float] | None = None,
+        websocket_heartbeat_paths: tuple[str, ...] = (),
     ):
         lifespan_handler = LifespanProtocol(callback)
         wcallback = _future_watcher_wrapper(
@@ -312,6 +328,8 @@ class Server(AbstractServer[AsyncWorker]):
             static_path,
             *ssl_ctx,
             (None, None),
+            websocket_heartbeat=websocket_heartbeat,
+            websocket_heartbeat_paths=websocket_heartbeat_paths,
         )
         serve = worker.serve_async_uds if (sock[0] or sock[1]).is_uds() else worker.serve_async
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)

@@ -24,7 +24,7 @@ macro_rules! serve_fn {
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
                 ) -> Ret
-                + Copy,
+                + Clone,
             M: Clone + Sync,
             Ret: Future<Output = crate::http::HTTPResponse>,
             Worker<C, A, H, F, M>: WorkerAcceptor<$listener> + Send + 'static,
@@ -140,7 +140,7 @@ macro_rules! serve_fn {
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
                 ) -> Ret
-                + Copy
+                + Clone
                 + Send,
             Ret: Future<Output = crate::http::HTTPResponse>,
             C: Clone + Send + 'static,
@@ -292,7 +292,7 @@ macro_rules! serve_fn {
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
                 ) -> Ret
-                + Copy
+                + Clone
                 + Send,
             Ret: Future<Output = crate::http::HTTPResponse>,
             C: Clone + Send + 'static,

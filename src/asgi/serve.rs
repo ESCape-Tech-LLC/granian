@@ -1,6 +1,10 @@
-use pyo3::prelude::*;
+use pyo3::{exceptions::PyValueError, prelude::*};
+use std::sync::Arc;
 
-use super::http::{handle, handle_ws};
+use super::{
+    heartbeat::HeartbeatConfig,
+    http::{handle, handle_ws},
+};
 
 use crate::callbacks::CallbackScheduler;
 use crate::conversion::{worker_http1_config_from_py, worker_http2_config_from_py};
@@ -8,9 +12,21 @@ use crate::net::{ListenerSpec, SocketHolder};
 use crate::serve::gen_serve_match;
 use crate::workers::{WorkerConfig, WorkerSignal};
 
+macro_rules! websocket_handler {
+    ($worker:expr) => {{
+        let config = $worker.websocket_heartbeat;
+        let paths = $worker.websocket_heartbeat_paths.clone();
+        move |rt, callback, server_addr, client_addr, req, scheme| {
+            handle_ws(rt, callback, server_addr, client_addr, req, scheme, config, paths.clone())
+        }
+    }};
+}
+
 #[pyclass(frozen, module = "granian._granian")]
 pub struct ASGIWorker {
     config: WorkerConfig,
+    websocket_heartbeat: Option<HeartbeatConfig>,
+    websocket_heartbeat_paths: Option<Arc<[String]>>,
 }
 
 #[pymethods]
@@ -40,6 +56,8 @@ impl ASGIWorker {
             ssl_crl=vec![],
             ssl_client_verify=false,
             metrics=(None, None),
+            websocket_heartbeat=None,
+            websocket_heartbeat_paths=vec![],
         )
     )]
     fn new(
@@ -66,8 +84,33 @@ impl ASGIWorker {
         ssl_crl: Vec<String>,
         ssl_client_verify: bool,
         metrics: (Option<u64>, Option<Py<crate::metrics::MetricsAggregator>>),
+        websocket_heartbeat: Option<(f64, f64, f64)>,
+        websocket_heartbeat_paths: Vec<String>,
     ) -> PyResult<Self> {
+        if !websocket_heartbeat_paths.is_empty() && websocket_heartbeat.is_none() {
+            return Err(PyValueError::new_err("WebSocket heartbeat paths require a Ping interval"));
+        }
+        if websocket_heartbeat_paths
+            .iter()
+            .any(|path| !path.starts_with('/') || path.contains(['?', '#']))
+        {
+            return Err(PyValueError::new_err(
+                "WebSocket heartbeat paths must be absolute URI paths without a query or fragment",
+            ));
+        }
+        let websocket_heartbeat = websocket_heartbeat
+            .map(|(interval, pong_timeout, close_timeout)| {
+                if !websockets_enabled || http_mode == "2" {
+                    return Err(PyValueError::new_err("WebSocket heartbeat requires HTTP/1 WebSockets"));
+                }
+                HeartbeatConfig::new(interval, pong_timeout, close_timeout)
+                    .ok_or_else(|| PyValueError::new_err("WebSocket heartbeat durations must be positive and finite"))
+            })
+            .transpose()?;
         Ok(Self {
+            websocket_heartbeat,
+            websocket_heartbeat_paths: (!websocket_heartbeat_paths.is_empty())
+                .then(|| websocket_heartbeat_paths.into()),
             config: WorkerConfig::new(
                 worker_id,
                 sock,
@@ -112,7 +155,7 @@ impl ASGIWorker {
             event_loop,
             signal,
             handle,
-            handle_ws
+            websocket_handler!(self)
         );
     }
 
@@ -133,7 +176,7 @@ impl ASGIWorker {
             event_loop,
             signal,
             handle,
-            handle_ws
+            websocket_handler!(self)
         );
     }
 
@@ -154,7 +197,7 @@ impl ASGIWorker {
             event_loop,
             signal,
             handle,
-            handle_ws
+            websocket_handler!(self)
         );
     }
 
@@ -176,7 +219,7 @@ impl ASGIWorker {
             event_loop,
             signal,
             handle,
-            handle_ws
+            websocket_handler!(self)
         );
     }
 
@@ -198,7 +241,7 @@ impl ASGIWorker {
             event_loop,
             signal,
             handle,
-            handle_ws
+            websocket_handler!(self)
         );
     }
 
@@ -220,7 +263,7 @@ impl ASGIWorker {
             event_loop,
             signal,
             handle,
-            handle_ws
+            websocket_handler!(self)
         );
     }
 }

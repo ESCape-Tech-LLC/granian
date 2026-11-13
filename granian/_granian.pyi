@@ -74,6 +74,9 @@ class ASGIWorker:
         ssl_ca: str | None,
         ssl_crl: list[str],
         ssl_client_verify: bool,
+        metrics: tuple[int | None, MetricsAggregator | None] = (None, None),
+        websocket_heartbeat: tuple[float, float, float] | None = None,
+        websocket_heartbeat_paths: tuple[str, ...] = (),
     ) -> ASGIWorker: ...
 
 class WSGIWorker:

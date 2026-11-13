@@ -308,7 +308,7 @@ where
             crate::http::HTTPRequest,
             crate::http::HTTPProto,
         ) -> Ret
-        + Copy,
+        + Clone,
     Ret: Future<Output = crate::http::HTTPResponse>,
 {
     pub fn new(ctx: C, acceptor: A, handler: H, rt: crate::runtime::RuntimeRef, target: F, metrics: M) -> Self {
@@ -361,7 +361,7 @@ macro_rules! service_impl {
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
                 ) -> Ret
-                + Copy
+                + Clone
                 + Send
                 + Sync
                 + 'static,
@@ -387,7 +387,7 @@ macro_rules! service_impl {
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
                 ) -> Ret
-                + Copy
+                + Clone
                 + Send
                 + Sync
                 + 'static,
@@ -427,7 +427,7 @@ macro_rules! service_impl {
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
                 ) -> Ret
-                + Copy
+                + Clone
                 + Send
                 + Sync
                 + 'static,
@@ -457,7 +457,7 @@ macro_rules! service_impl {
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
                 ) -> Ret
-                + Copy
+                + Clone
                 + Send
                 + Sync
                 + 'static,
@@ -1043,7 +1043,7 @@ macro_rules! acceptor_impl_loop {
         while accept_loop {
             let rt = $self.rt.clone();
             let tasks = $self.tasks.clone();
-            let target = $self.target;
+            let target = $self.target.clone();
             let ctx = $self.ctx.clone();
             let semaphore = semaphore.clone();
             let connsig = connsig.clone();
@@ -1087,7 +1087,7 @@ macro_rules! acceptor_impl {
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
                 ) -> Ret
-                + Copy
+                + Clone
                 + Send
                 + Sync
                 + 'static,
@@ -1119,7 +1119,7 @@ macro_rules! acceptor_impl {
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
                 ) -> Ret
-                + Copy
+                + Clone
                 + Send
                 + Sync
                 + 'static,
@@ -1152,7 +1152,7 @@ macro_rules! acceptor_impl {
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
                 ) -> Ret
-                + Copy
+                + Clone
                 + Send
                 + Sync
                 + 'static,
@@ -1184,7 +1184,7 @@ macro_rules! acceptor_impl {
                     crate::http::HTTPRequest,
                     crate::http::HTTPProto,
                 ) -> Ret
-                + Copy
+                + Clone
                 + Send
                 + Sync
                 + 'static,

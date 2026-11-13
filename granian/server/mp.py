@@ -136,6 +136,8 @@ class MPServer(AbstractServer[WorkerProcess]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         metrics: Any,
+        websocket_heartbeat: tuple[float, float, float] | None = None,
+        websocket_heartbeat_paths: tuple[str, ...] = (),
     ):
         from granian._signals import set_loop_signals
 
@@ -170,6 +172,8 @@ class MPServer(AbstractServer[WorkerProcess]):
             static_path,
             *ssl_ctx,
             metrics,
+            websocket_heartbeat=websocket_heartbeat,
+            websocket_heartbeat_paths=websocket_heartbeat_paths,
         )
         serve = getattr(worker, WORKERS_METHODS[runtime_mode][(sock[0] or sock[1]).is_uds()])
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
@@ -200,6 +204,8 @@ class MPServer(AbstractServer[WorkerProcess]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         metrics: Any,
+        websocket_heartbeat: tuple[float, float, float] | None = None,
+        websocket_heartbeat_paths: tuple[str, ...] = (),
     ):
         from granian._signals import set_loop_signals
 
@@ -242,6 +248,8 @@ class MPServer(AbstractServer[WorkerProcess]):
             static_path,
             *ssl_ctx,
             metrics,
+            websocket_heartbeat=websocket_heartbeat,
+            websocket_heartbeat_paths=websocket_heartbeat_paths,
         )
         serve = getattr(worker, WORKERS_METHODS[runtime_mode][(sock[0] or sock[1]).is_uds()])
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
@@ -487,6 +495,8 @@ class MPServer(AbstractServer[WorkerProcess]):
                 self.ssl_ctx,
                 {'url_path_prefix': self.url_path_prefix},
                 (self.metrics_scrape_interval if self.metrics_enabled else None, None),
+                *((self.websocket_heartbeat,) if self.websocket_heartbeat is not None else ()),
+                *((self.websocket_heartbeat_paths,) if self.websocket_heartbeat_paths else ()),
             ),
         )
 

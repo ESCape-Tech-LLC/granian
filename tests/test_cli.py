@@ -1,7 +1,10 @@
+from types import SimpleNamespace
+
 import click
 import pytest
+from click.testing import CliRunner
 
-from granian.cli import Duration
+from granian.cli import Duration, cli
 
 
 @pytest.mark.parametrize(
@@ -47,3 +50,39 @@ def test_duration_convert_out_of_range(value: str, error_message: str) -> None:
     duration_type = Duration(10, 100)
     with pytest.raises(click.BadParameter, match=error_message):
         duration_type.convert(value, None, None)
+
+
+def test_heartbeat_path_option_is_repeatable(monkeypatch):
+    options = {}
+
+    def server(_app, **kwargs):
+        options.update(kwargs)
+        return SimpleNamespace(serve=lambda: None)
+
+    monkeypatch.setattr('granian.cli.Server', server)
+    monkeypatch.setattr('granian._internal.patch_pypath', lambda _: None)
+    result = CliRunner().invoke(
+        cli,
+        [
+            '--interface',
+            'asgi',
+            '--ws-ping-interval',
+            '20',
+            '--ws-heartbeat-path',
+            '/api/v4/ws',
+            '--ws-heartbeat-path',
+            '/private/ws',
+            'app:app',
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert options['websocket_heartbeat_paths'] == ('/api/v4/ws', '/private/ws')
+    assert options['websocket_ping_interval'] == 20
+
+
+def test_heartbeat_path_option_requires_ping_interval():
+    result = CliRunner().invoke(cli, ['--ws-heartbeat-path', '/api/v4/ws', 'app:app'])
+
+    assert result.exit_code == 2
+    assert '--ws-heartbeat-path requires --ws-ping-interval' in result.output

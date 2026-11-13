@@ -93,6 +93,8 @@ class MTServer(AbstractServer[WorkerThread]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         metrics: Any,
+        websocket_heartbeat: tuple[float, float, float] | None = None,
+        websocket_heartbeat_paths: tuple[str, ...] = (),
     ):
         wcallback = _future_watcher_wrapper(_asgi_call_wrap(callback, scope_opts, {}, log_access_fmt))
         evp = asyncio.Event()
@@ -124,6 +126,8 @@ class MTServer(AbstractServer[WorkerThread]):
             static_path,
             *ssl_ctx,
             metrics,
+            websocket_heartbeat=websocket_heartbeat,
+            websocket_heartbeat_paths=websocket_heartbeat_paths,
         )
         serve = getattr(worker, WORKERS_METHODS[runtime_mode][(sock[0] or sock[1]).is_uds()])
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
@@ -154,6 +158,8 @@ class MTServer(AbstractServer[WorkerThread]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         metrics: Any,
+        websocket_heartbeat: tuple[float, float, float] | None = None,
+        websocket_heartbeat_paths: tuple[str, ...] = (),
     ):
         lifespan_handler = LifespanProtocol(callback)
         wcallback = _future_watcher_wrapper(
@@ -193,6 +199,8 @@ class MTServer(AbstractServer[WorkerThread]):
             static_path,
             *ssl_ctx,
             metrics,
+            websocket_heartbeat=websocket_heartbeat,
+            websocket_heartbeat_paths=websocket_heartbeat_paths,
         )
         serve = getattr(worker, WORKERS_METHODS[runtime_mode][(sock[0] or sock[1]).is_uds()])
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
@@ -351,6 +359,8 @@ class MTServer(AbstractServer[WorkerThread]):
                 self.ssl_ctx,
                 {'url_path_prefix': self.url_path_prefix},
                 (self.metrics_scrape_interval if self.metrics_enabled else None, self._metrics),
+                *((self.websocket_heartbeat,) if self.websocket_heartbeat is not None else ()),
+                *((self.websocket_heartbeat_paths,) if self.websocket_heartbeat_paths else ()),
             ),
             sig=sig,
         )

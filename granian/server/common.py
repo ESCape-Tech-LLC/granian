@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import math
 import multiprocessing
 import os
 import ssl
@@ -150,6 +151,10 @@ class AbstractServer(Generic[WT]):
         reload_ignore_worker_failure: bool = False,
         process_name: str | None = None,
         pid_file: Path | None = None,
+        websocket_ping_interval: float | None = None,
+        websocket_ping_timeout: float = 10,
+        websocket_close_timeout: float = 5,
+        websocket_heartbeat_paths: Sequence[str] | None = None,
     ):
         self.target = target
         self.bind_addr = address
@@ -165,6 +170,30 @@ class AbstractServer(Generic[WT]):
         self.task_impl = task_impl
         self.http = http
         self.websockets = websockets
+        self.websocket_heartbeat: tuple[float, float, float] | None = None
+        if isinstance(websocket_heartbeat_paths, str):
+            raise ConfigurationError('websocket_heartbeat_paths must be a sequence of absolute URI paths')
+        self.websocket_heartbeat_paths = tuple(websocket_heartbeat_paths or ())
+        if self.websocket_heartbeat_paths and websocket_ping_interval is None:
+            raise ConfigurationError('websocket_heartbeat_paths requires websocket_ping_interval')
+        if any(
+            not isinstance(path, str) or not path.startswith('/') or '?' in path or '#' in path
+            for path in self.websocket_heartbeat_paths
+        ):
+            raise ConfigurationError('WebSocket heartbeat paths must be absolute URI paths without a query or fragment')
+        if websocket_ping_interval is not None:
+            if interface not in (Interfaces.ASGI, Interfaces.ASGINL) or not websockets or http == HTTPModes.http2:
+                raise ConfigurationError('WebSocket heartbeat requires ASGI with HTTP/1 WebSockets enabled')
+            self.websocket_heartbeat = (websocket_ping_interval, websocket_ping_timeout, websocket_close_timeout)
+        for name, duration in (
+            ('websocket_ping_interval', websocket_ping_interval),
+            ('websocket_ping_timeout', websocket_ping_timeout),
+            ('websocket_close_timeout', websocket_close_timeout),
+        ):
+            if name == 'websocket_ping_interval' and duration is None:
+                continue
+            if duration is None or not math.isfinite(duration) or duration <= 0:
+                raise ConfigurationError(f'{name} must be a positive finite duration in seconds')
         self.backlog = max(128, backlog)
         self.backpressure = max(1, backpressure or self.backlog // self.workers)
         self.blocking_threads = (

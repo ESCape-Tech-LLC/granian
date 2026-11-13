@@ -3,7 +3,10 @@ use hyper::{StatusCode, header::SERVER as HK_SERVER, http::response::Builder as 
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
 
-use super::callbacks::{call_http, call_ws};
+use super::{
+    callbacks::{call_http, call_ws},
+    heartbeat::HeartbeatConfig,
+};
 use crate::{
     callbacks::ArcCBScheduler,
     http::{HTTPProto, HTTPRequest, HTTPResponse, HV_SERVER, empty_body, response_500},
@@ -60,9 +63,16 @@ macro_rules! handle_request_with_ws {
             client_addr: SockAddr,
             mut req: HTTPRequest,
             scheme: HTTPProto,
+            heartbeat: Option<HeartbeatConfig>,
+            heartbeat_paths: Option<Arc<[String]>>,
         ) -> HTTPResponse {
             if is_ws_upgrade(&req) {
-                return match ws_upgrade(&mut req, None) {
+                let heartbeat = heartbeat.filter(|_| {
+                    heartbeat_paths
+                        .as_ref()
+                        .is_none_or(|paths| paths.iter().any(|path| path == req.uri().path()))
+                });
+                return match ws_upgrade(&mut req, heartbeat.map(HeartbeatConfig::websocket_config)) {
                     Ok((res, ws)) => {
                         let (restx, mut resrx) = mpsc::channel(1);
                         let (parts, _) = req.into_parts();
@@ -82,6 +92,7 @@ macro_rules! handle_request_with_ws {
                                 ws,
                                 parts,
                                 UpgradeData::new(res, restx),
+                                heartbeat,
                             )
                             .await
                             {

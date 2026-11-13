@@ -392,6 +392,40 @@ Whenever Granian accepts a duration, it can be specified either as sole number, 
 | `h` | hours |
 | `d` | days |
 
+### ASGI WebSocket heartbeat
+
+Use `--ws-ping-interval` to enable transport Ping/Pong for ASGI WebSockets.
+The interval and the `--ws-ping-timeout` and `--ws-close-timeout` options
+take positive durations in seconds. The timeout defaults are 10 and 5
+seconds. The equivalent Python arguments are `websocket_ping_interval`,
+`websocket_ping_timeout` and `websocket_close_timeout`.
+
+For example, `granian --interface asgi --ws-ping-interval 20 app:app`
+sends a Ping every 20 seconds. Granian checks the matching Pong even while
+the application is busy. The Ping timeout covers sending the frame and
+receiving the reply. After a timeout, Granian initiates a WebSocket close
+with code 1011, then releases the connection by the close timeout even if
+socket writes are blocked. Applications receive `websocket.disconnect`.
+
+To enable heartbeat for only some upgrades on a shared gateway, repeat
+`--ws-heartbeat-path` for each path. The Python equivalent is
+`websocket_heartbeat_paths=["/api/v4/ws"]`.
+
+```console
+granian --interface asgi --ws-ping-interval 20 --ws-heartbeat-path /api/v4/ws app:app
+```
+
+Granian matches each path exactly against the request URI it receives
+after any proxy rewrite. Query parameters do not affect the match. With
+the example above, `/api/v4/ws?client=mobile` uses native Ping/Pong and
+`/api/v4/ws/legacy` keeps the original transport. Omitting the filter
+enables heartbeat on all ASGI WebSocket upgrades when a Ping interval
+is configured. A nonempty filter requires a Ping interval.
+
+With heartbeat enabled, Granian buffers up to 64 incoming application
+messages totalling up to 8 MiB. Queue overflow closes the connection with
+code 1013. A message larger than the byte limit closes it with code 1009.
+
 ### Logging
 
 Despite being a Rust project, Granian is a good Python citizen and uses the standard library's [`logging`](https://docs.python.org/3/library/logging.html) module to produce logs. This means you can freely configure your logging level and format using the [standard idioms](https://docs.python.org/3/howto/logging.html) you probably familiar with.
@@ -478,6 +512,7 @@ Granian exposes the following runtime metrics in Prometheus format. All the metr
 | `workers_respawns_for_lifetime` | counter | absolute number | global | Number of times Granian respawned a worker due to exceeding lifetime |
 | `worker_lifetime` | counter | seconds | worker | Current lifetime of the worker |
 | `connections_active` | gauge | absolute number | worker | Number of active connections |
+| `websocket_heartbeat_active` | gauge | absolute number | worker | Number of active ASGI WebSockets with transport heartbeat enabled |
 | `connections_handled` | counter | absolute number | worker | Number of accepted connections |
 | `connections_err` | gauge | absolute number | worker | Number of failed connections |
 | `requests_handled` | counter | absolute number | worker | Number of processed requests |

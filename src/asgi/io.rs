@@ -21,6 +21,7 @@ use tokio_util::io::ReaderStream;
 
 use super::{
     errors::{UnsupportedASGIMessage, error_flow, error_message},
+    heartbeat::{HeartbeatConfig, HeartbeatTransport},
     types::ASGIMessageType,
 };
 use crate::{
@@ -371,6 +372,7 @@ pub(crate) struct WebsocketDetachedTransport {
     rx: Option<WSRxStream>,
     tx: Option<WSTxStream>,
     closeframe: Option<wsframe::CloseFrame>,
+    heartbeat: Option<Arc<HeartbeatTransport>>,
 }
 
 impl WebsocketDetachedTransport {
@@ -385,10 +387,15 @@ impl WebsocketDetachedTransport {
             rx,
             tx,
             closeframe,
+            heartbeat: None,
         }
     }
 
     pub async fn close(&mut self) {
+        if let Some(transport) = self.heartbeat.take() {
+            transport.close(None).await;
+            return;
+        }
         if let Some(mut tx) = self.tx.take() {
             if let Some(frame) = self.closeframe.take() {
                 _ = tx.send(Message::Close(Some(frame))).await;
@@ -409,6 +416,8 @@ pub(crate) struct ASGIWebsocketProtocol {
     websocket: Mutex<Option<HyperWebsocket>>,
     upgrade: Mutex<Option<UpgradeData>>,
     response_intent: Mutex<Option<(u16, HeaderMap)>>,
+    heartbeat_config: Option<HeartbeatConfig>,
+    heartbeat: Arc<Mutex<Option<Arc<HeartbeatTransport>>>>,
     ws_rx: Arc<AsyncMutex<Option<WSRxStream>>>,
     ws_tx: Arc<AsyncMutex<Option<WSTxStream>>>,
     init_rx: atomic::AtomicBool,
@@ -418,12 +427,13 @@ pub(crate) struct ASGIWebsocketProtocol {
 }
 
 impl ASGIWebsocketProtocol {
-    pub fn new(
+    pub(super) fn new(
         rt: RuntimeRef,
         tx: oneshot::Sender<WebsocketDetachedTransport>,
         websocket: HyperWebsocket,
         upgrade: UpgradeData,
         disconnect_guard: Arc<Notify>,
+        heartbeat_config: Option<HeartbeatConfig>,
     ) -> Self {
         Self {
             rt,
@@ -432,6 +442,8 @@ impl ASGIWebsocketProtocol {
             websocket: Mutex::new(Some(websocket)),
             upgrade: Mutex::new(Some(upgrade)),
             response_intent: Mutex::new(None),
+            heartbeat_config,
+            heartbeat: Arc::new(Mutex::new(None)),
             ws_rx: Arc::new(AsyncMutex::new(None)),
             ws_tx: Arc::new(AsyncMutex::new(None)),
             init_rx: false.into(),
@@ -450,6 +462,10 @@ impl ASGIWebsocketProtocol {
         let closed = self.closed.clone();
         let rx = self.ws_rx.clone();
         let tx = self.ws_tx.clone();
+        let heartbeat_config = self.heartbeat_config;
+        let heartbeat = self.heartbeat.clone();
+        let runtime = self.rt.clone();
+        let shutdown = self.disconnect_guard.clone();
 
         future_into_py_futlike(self.rt.clone(), py, async move {
             if let Some(mut upgrade) = upgrade {
@@ -461,12 +477,18 @@ impl ASGIWebsocketProtocol {
                     && let Some(websocket) = websocket
                     && let Ok(stream) = websocket.await
                 {
-                    let mut wtx = tx.lock().await;
-                    let mut wrx = rx.lock().await;
-                    let (tx, rx) = stream.split();
-                    *wtx = Some(tx);
-                    *wrx = Some(rx);
-                    drop(wrx);
+                    if let Some(config) = heartbeat_config {
+                        let mut active = heartbeat.lock().unwrap();
+                        if !closed.load(atomic::Ordering::Acquire) {
+                            *active = Some(Arc::new(HeartbeatTransport::spawn(&runtime, stream, config, shutdown)));
+                        }
+                    } else {
+                        let mut wtx = tx.lock().await;
+                        let mut wrx = rx.lock().await;
+                        let (tx, rx) = stream.split();
+                        *wtx = Some(tx);
+                        *wrx = Some(rx);
+                    }
                     accepted.store(true, atomic::Ordering::Release);
                     accept_notify.notify_one();
                     return FutureResultToPy::None;
@@ -528,6 +550,13 @@ impl ASGIWebsocketProtocol {
             return empty_future_into_py(py);
         }
 
+        if let Some(transport) = self.heartbeat.lock().unwrap().clone() {
+            return future_into_py_futlike(self.rt.clone(), py, async move {
+                transport.send(data).await;
+                FutureResultToPy::None
+            });
+        }
+
         let transport = self.ws_tx.clone();
         let closed = self.closed.clone();
         future_into_py_futlike(self.rt.clone(), py, async move {
@@ -555,6 +584,15 @@ impl ASGIWebsocketProtocol {
         let ws_tx = self.ws_tx.clone();
         self.closed.store(true, atomic::Ordering::Release);
 
+        if let Some(transport) = self.heartbeat.lock().unwrap().clone() {
+            // Request shutdown synchronously in case the Python future is cancelled.
+            transport.request_close(frame);
+            return future_into_py_futlike(self.rt.clone(), py, async move {
+                transport.close(None).await;
+                FutureResultToPy::None
+            });
+        }
+
         future_into_py_futlike(self.rt.clone(), py, async move {
             if let Some(tx) = ws_tx.lock().await.take() {
                 WebsocketDetachedTransport::new(true, ws_rx.lock().await.take(), Some(tx), frame)
@@ -580,10 +618,12 @@ impl ASGIWebsocketProtocol {
         self.closed.store(true, atomic::Ordering::Release);
         let ws_rx = self.ws_rx.try_lock().map_or(None, |mut guard| guard.take());
         let ws_tx = self.ws_tx.try_lock().map_or(None, |mut guard| guard.take());
-        (
-            self.tx.lock().unwrap().take(),
-            WebsocketDetachedTransport::new(self.consumed(), ws_rx, ws_tx, None),
-        )
+        let mut detached = WebsocketDetachedTransport::new(self.consumed(), ws_rx, ws_tx, None);
+        detached.heartbeat = self.heartbeat.lock().unwrap().take();
+        if let Some(transport) = detached.heartbeat.as_ref() {
+            transport.request_close(None);
+        }
+        (self.tx.lock().unwrap().take(), detached)
     }
 }
 
@@ -614,11 +654,21 @@ impl ASGIWebsocketProtocol {
         let closed = self.closed.clone();
         let transport = self.ws_rx.clone();
         let guard_disconnect = self.disconnect_guard.clone();
+        let heartbeat = self.heartbeat.clone();
 
         future_into_py_futlike(self.rt.clone(), py, async move {
             if !accepted.load(atomic::Ordering::Acquire) {
                 // need to wait for the protocol to send the accept message and init transport
                 accepted_ev.notified().await;
+            }
+
+            let active = heartbeat.lock().unwrap().clone();
+            if let Some(active) = active {
+                let message = active.receive().await;
+                if matches!(message, Message::Close(_)) {
+                    closed.store(true, atomic::Ordering::Release);
+                }
+                return FutureResultToPy::ASGIWSMessage(message);
             }
 
             if let Some(ws) = &mut *(transport.lock().await) {

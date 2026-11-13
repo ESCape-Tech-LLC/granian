@@ -46,6 +46,7 @@ pub(crate) struct RuntimeWrapper {
     br: Arc<blocking::BlockingRunner>,
     pr: Arc<Py<PyAny>>,
     sig: Arc<tokio::sync::Notify>,
+    metrics: Option<metrics::ArcWorkerMetrics>,
 }
 
 impl RuntimeWrapper {
@@ -56,7 +57,7 @@ impl RuntimeWrapper {
         py_loop: Arc<Py<PyAny>>,
         metrics: Option<metrics::ArcWorkerMetrics>,
     ) -> Self {
-        let br = match metrics {
+        let br = match metrics.clone() {
             Some(metrics) => blocking::BlockingRunner::new_with_metrics(py_threads, py_threads_idle_timeout, metrics),
             None => blocking::BlockingRunner::new(py_threads, py_threads_idle_timeout),
         };
@@ -65,6 +66,7 @@ impl RuntimeWrapper {
             br: br.into(),
             pr: py_loop,
             sig: tokio::sync::Notify::new().into(),
+            metrics,
         }
     }
 
@@ -75,7 +77,7 @@ impl RuntimeWrapper {
         py_loop: Arc<Py<PyAny>>,
         metrics: Option<metrics::ArcWorkerMetrics>,
     ) -> Self {
-        let br = match metrics {
+        let br = match metrics.clone() {
             Some(metrics) => blocking::BlockingRunner::new_with_metrics(py_threads, py_threads_idle_timeout, metrics),
             None => blocking::BlockingRunner::new(py_threads, py_threads_idle_timeout),
         };
@@ -84,6 +86,7 @@ impl RuntimeWrapper {
             br: br.into(),
             pr: py_loop,
             sig: tokio::sync::Notify::new().into(),
+            metrics,
         }
     }
 
@@ -93,6 +96,7 @@ impl RuntimeWrapper {
             self.br.clone(),
             self.pr.clone(),
             self.sig.clone(),
+            self.metrics.clone(),
         )
     }
 }
@@ -103,6 +107,7 @@ pub struct RuntimeRef {
     innerb: Arc<blocking::BlockingRunner>,
     innerp: Arc<Py<PyAny>>,
     sig: Arc<tokio::sync::Notify>,
+    metrics: Option<metrics::ArcWorkerMetrics>,
 }
 
 impl RuntimeRef {
@@ -111,13 +116,19 @@ impl RuntimeRef {
         br: Arc<blocking::BlockingRunner>,
         pyloop: Arc<Py<PyAny>>,
         sig: Arc<tokio::sync::Notify>,
+        metrics: Option<metrics::ArcWorkerMetrics>,
     ) -> Self {
         Self {
             inner: rt,
             innerb: br,
             innerp: pyloop,
             sig,
+            metrics,
         }
+    }
+
+    pub(crate) fn metrics(&self) -> Option<metrics::ArcWorkerMetrics> {
+        self.metrics.clone()
     }
 
     pub fn close(&self) {
