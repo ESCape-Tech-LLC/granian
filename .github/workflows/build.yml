@@ -32,11 +32,13 @@ jobs:
           - os: ubuntu
             platform: linux
             target: i686
+            runner: ubuntu-24.04
             interpreter: 3.10 3.11 3.12 3.13 3.14 3.15
             allocator: jemalloc
           - os: ubuntu
             platform: linux
             target: i686
+            runner: ubuntu-24.04
             interpreter: 3.14t 3.15t
             allocator: mimalloc
           - os: ubuntu
@@ -91,7 +93,7 @@ jobs:
             interpreter: 3.10 3.11 3.12 3.13 3.14 3.14t 3.15 3.15t pypy3.11
             allocator: mimalloc
 
-    runs-on: ${{ matrix.os }}-latest
+    runs-on: ${{ matrix.runner || format('{0}-latest', matrix.os) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -100,6 +102,10 @@ jobs:
         if: matrix.target == 'aarch64' && matrix.os == 'ubuntu'
         run: |
           echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> $GITHUB_ENV
+      - name: Fix CFLAGS for mimalloc on MacOS
+        if: matrix.os == 'macos' && matrix.allocator == 'mimalloc'
+        run: |
+          echo "CFLAGS=-DMI_HAS_TLS_SLOT=0" >> $GITHUB_ENV
       - uses: pyo3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           rust-toolchain: stable
@@ -108,9 +114,9 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           container: ${{ matrix.container }}
-          docker-options: -e CI
+          docker-options: -e CI --dns 1.1.1.1
       - name: Upload wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.platform || matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux || 'auto' }}-${{ matrix.allocator || 'auto' }}
           path: dist
